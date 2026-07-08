@@ -9,7 +9,7 @@ from scipy.stats import poisson
 # ==========================================
 # ตั้งค่า API
 # ==========================================
-API_KEY = st.secrets.get("API_KEY", "ynl1sr2l6ljzaole") 
+API_KEY = st.secrets["API_KEY"] 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}", 
     "Accept": "application/json"
