@@ -11,54 +11,14 @@ from scipy.stats import poisson
 # ==========================================
 # ตั้งค่า API
 # ==========================================
-API_KEY = st.secrets["API_KEY"] 
+API_KEY = st.secrets.get("API_KEY", "ynl1sr2l6ljzaole") 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}", 
     "Accept": "application/json"
 }
 
 # ==========================================
-# ฟังก์ชันบันทึกลง Google Sheets
-# ==========================================
-def save_to_google_sheet(results_data):
-    try:
-        # ดึงข้อมูล Key จาก Secrets
-        service_account_info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"])
-        credentials = gspread.service_account_from_dict(service_account_info)
-        
-        # เชื่อมต่อไปยัง Google Sheets ของคุณโดยใช้ ID จากลิงก์
-        client = gspread.authorize(credentials)
-        spreadsheet = client.open_by_key("1jLkfy3S2c59GzliqEGltd9PdaV-ozKGkGiB488ueIPw")
-        worksheet = spreadsheet.sheet1
-        
-        # จัดรูปแบบข้อมูลให้พร้อมเขียน
-        rows_to_add = []
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        for r in results_data:
-            # ลบสัญลักษณ์ ฿ และ + ออก เพื่อให้ Excel คำนวณผลรวมได้ง่าย
-            profit_str = str(r.get('กำไร/ขาดทุน', '0')).replace(' ฿', '').replace('+', '')
-            
-            rows_to_add.append([
-                today_str,
-                r.get('ลีก', ''),
-                r.get('คู่บอล', ''),
-                r.get('สกอร์จริง', ''),
-                str(r.get('เดิมพัน', '0')).replace(' ฿', ''),
-                'ได้' if 'ได้' in str(r.get('ผลลัพธ์', '')) else 'เสีย',
-                profit_str
-            ])
-            
-        # เขียนข้อมูลแถวใหม่ลงไป
-        if rows_to_add:
-            worksheet.append_rows(rows_to_add)
-            return True
-        return False
-    except Exception as e:
-        st.error(f"❌ เกิดข้อผิดพลาดในการบันทึก Google Sheets: {e}")
-        return False
-
-# ==========================================
-# ฟังก์ชันคำนวณ (เหมือนเดิม)
+# ฟังก์ชันคำนวณ
 # ==========================================
 def calculate_poisson_under(lambda_home, lambda_away):
     under_prob = 0
@@ -145,6 +105,39 @@ def create_excel_with_formula(df_edited, current_bankroll):
     return output
 
 # ==========================================
+# ฟังก์ชันบันทึกลง Google Sheets
+# ==========================================
+def save_to_google_sheet(results_data):
+    try:
+        service_account_info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"])
+        credentials = gspread.service_account_from_dict(service_account_info)
+        client = gspread.authorize(credentials)
+        spreadsheet = client.open_by_key("1jLkfy3S2c59GzliqEGltd9PdaV-ozKGkGiB488ueIPw")
+        worksheet = spreadsheet.sheet1
+        
+        rows_to_add = []
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        for r in results_data:
+            profit_str = str(r.get('กำไร/ขาดทุน', '0')).replace(' ฿', '').replace('+', '')
+            rows_to_add.append([
+                today_str,
+                r.get('ลีก', ''),
+                r.get('คู่บอล', ''),
+                r.get('สกอร์จริง', ''),
+                str(r.get('เดิมพัน', '0')).replace(' ฿', ''),
+                'ได้' if 'ได้' in str(r.get('ผลลัพธ์', '')) else 'เสีย',
+                profit_str
+            ])
+            
+        if rows_to_add:
+            worksheet.append_rows(rows_to_add)
+            return True
+        return False
+    except Exception as e:
+        st.error(f"❌ เกิดข้อผิดพลาดในการบันทึก Google Sheets: {e}")
+        return False
+
+# ==========================================
 # Session State
 # ==========================================
 if 'approved_matches' not in st.session_state:
@@ -153,7 +146,7 @@ if 'near_misses' not in st.session_state:
     st.session_state.near_misses = []
 
 # ==========================================
-# UI หลัก (ใช้ Tabs แยกหน้า)
+# UI หลัก
 # ==========================================
 st.set_page_config(page_title="Under Bot v2.0", page_icon="🚀", layout="wide")
 st.title("🚀 UNDER BOT - Pro Backtesting Edition")
@@ -161,7 +154,7 @@ st.title("🚀 UNDER BOT - Pro Backtesting Edition")
 tab1, tab2 = st.tabs(["🔍 สแกนคู่วันนี้", "📊 สรุปผลเมื่อวาน (Backtest)"])
 
 # ==========================================
-# TAB 1: สแกนคู่วันนี้ (โค้ดเดิมทั้งหมด)
+# TAB 1
 # ==========================================
 with tab1:
     with st.expander("⚙️ ตั้งค่าเกณฑ์การคัดกรอง", expanded=False):
@@ -240,38 +233,20 @@ with tab1:
         df_near = pd.DataFrame(st.session_state.near_misses); df_near = df_near.sort_values(by='คะแนน', ascending=False).head(3).reset_index(drop=True)
         st.dataframe(df_near, width="stretch", hide_index=True)
 
-            if results:
-                st.divider()
-                df_results = pd.DataFrame(results)
-                
-                # ... (ส่วนคำนวณ Metric และแสดงตารางเดิม) ...
-                c1.metric("คู่ที่แทง", len(df_results))
-                c2.metric("Win Rate", f"{win_rate:.1f}%")
-                c3.metric("ROI วันนี้", f"{roi:.2f}%", delta=f"{total_pl:.0f} ฿")
-                
-                st.dataframe(df_results, width="stretch", hide_index=True)
-                
-                # 🌟 เพิ่มปุ่มบันทึกลง Google Sheets
-                if st.button("💾 บันทึกผลลัพธ์นี้ลง Google Sheets", type="primary", use_container_width=True):
-                    if save_to_google_sheet(results):
-                        st.success("✅ บันทึกข้อมูลสำเร็จแล้ว! ลองเปิด Google Sheets ดูได้เลยครับ")
-                    else:
-                        st.error("เกิดข้อผิดพลาด ลองตรวจสอบ Secrets หรือสิทธิ์การแชร์ไฟล์")
 # ==========================================
-# TAB 2: สรุปผลเมื่อวาน (โค้ดใหม่)
+# TAB 2 (แก้เยื้องให้เรียบร้อยแล้ว + เพิ่มลีก)
 # ==========================================
 with tab2:
     st.markdown("### 📈 ระบบทดสอบย้อนหลัง (Backtesting)")
     st.caption("ระบบจะย้อนไปดูเกมเมื่อวานที่จบแล้ว และคำนวณว่า 'ถ้าเราแทงทุกคู่ที่ผ่านเกณฑ์ จะได้กำไรหรือเสียเงิน'")
     
-    # ใช้ค่าเกณฑ์เดียวกับวันนี้
     col1, col2 = st.columns(2)
     with col1:
         back_score = st.slider("🎯 คะแนนเกณฑ์ที่ใช้ทดสอบ", min_value=40, max_value=80, value=60, step=5, key="score_yest")
     with col2:
         back_xg = st.slider("📊 ค่า xG ที่ใช้ทดสอบ", min_value=2.0, max_value=3.5, value=2.6, step=0.1, key="xg_yest")
     back_bank = st.number_input("💰 เงินทุนสมมติฐาน (บาท)", min_value=100, value=5000, step=100, key="bank_yest")
-    ASSUMED_ODDS = 1.70 # สมมติฐานราคาน้ำเฉลี่ย
+    ASSUMED_ODDS = 1.70
     
     if st.button("🔄 เริ่มวิเคราะห์ผลเมื่อวาน", type="primary", use_container_width=True):
         yesterday_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -282,7 +257,6 @@ with tab2:
             try:
                 res_list = requests.get(LIST_URL_YEST, headers=HEADERS, timeout=10).json()
                 games = res_list.get('data', [])
-                # ดึงเฉพาะเกมที่เลิกแล้ว
                 games = [g for g in games if g.get('statusName', '').lower() == 'finished']
             except: games = []
 
@@ -315,16 +289,15 @@ with tab2:
                     poisson_prob = calculate_poisson_under(home_xg, away_xg)
                     score = calculate_score(combined_xg, poisson_prob, back_xg)
                     
-                    # ถ้าผ่านเกณฑ์ ถือว่าเรา "แทง"
                     if score >= back_score:
-                        is_win = total_goals <= 2 # Under 2.5 ได้
+                        is_win = total_goals <= 2
                         stake_pct, bet_amount = calculate_kelly_stake(ASSUMED_ODDS, poisson_prob, back_bank)
                         profit_loss = (bet_amount * (ASSUMED_ODDS - 1)) if is_win else -bet_amount
                         
                         results.append({
+                            'ลีก': f"{g.get('season', {}).get('league', {}).get('country', {}).get('name', '')} - {g.get('season', {}).get('league', {}).get('name', 'Unknown')}",
                             'คู่บอล': f"{home} vs {away}",
                             'สกอร์จริง': f"{home_ft}-{away_ft} (รวม {total_goals})",
-                            'xG รวม': combined_xg,
                             'เดิมพัน': f"{bet_amount:.0f} ฿",
                             'ผลลัพธ์': '✅ ได้' if is_win else '❌ เสีย',
                             'กำไร/ขาดทุน': f"{'+' if profit_loss > 0 else ''}{profit_loss:.0f} ฿"
@@ -338,21 +311,22 @@ with tab2:
                 st.divider()
                 df_results = pd.DataFrame(results)
                 
-                # คำนวณ ROI
                 total_pl = sum([float(str(p).replace(' ฿','').replace('+','')) for p in df_results['กำไร/ขาดทุน']])
                 wins = len(df_results[df_results['ผลลัพธ์'] == '✅ ได้'])
                 win_rate = (wins / len(df_results)) * 100
                 roi = (total_pl / back_bank) * 100
                 
-                # แสดงสรุป
                 c1, c2, c3 = st.columns(3)
                 c1.metric("คู่ที่แทง", len(df_results))
                 c2.metric("Win Rate", f"{win_rate:.1f}%")
                 c3.metric("ROI วันนี้", f"{roi:.2f}%", delta=f"{total_pl:.0f} ฿")
                 
                 st.dataframe(df_results, width="stretch", hide_index=True)
+                
+                if st.button("💾 บันทึกผลลัพธ์นี้ลง Google Sheets", type="primary", use_container_width=True):
+                    if save_to_google_sheet(results):
+                        st.success("✅ บันทึกข้อมูลสำเร็จแล้ว! ลองเปิด Google Sheets ดูได้เลยครับ")
+                    else:
+                        st.error("เกิดข้อผิดพลาด ลองตรวจสอบ Secrets หรือสิทธิ์การแชร์ไฟล์")
             else:
                 st.warning("เมื่อวานไม่มีคู่ไหนผ่านเกณฑ์เลยครับ")
-
-    if not st.session_state.approved_matches and not st.session_state.near_misses:
-        pass # ซ่อน error ของแท็บ 1 ถ้ายังไม่กดสแกน
