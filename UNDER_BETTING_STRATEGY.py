@@ -3,6 +3,8 @@ import requests
 import pandas as pd
 import time
 import io
+import gspread
+import json
 from datetime import datetime, timezone, timedelta
 from scipy.stats import poisson
 
@@ -14,6 +16,46 @@ HEADERS = {
     "Authorization": f"Bearer {API_KEY}", 
     "Accept": "application/json"
 }
+
+# ==========================================
+# ฟังก์ชันบันทึกลง Google Sheets
+# ==========================================
+def save_to_google_sheet(results_data):
+    try:
+        # ดึงข้อมูล Key จาก Secrets
+        service_account_info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"])
+        credentials = gspread.service_account_from_dict(service_account_info)
+        
+        # เชื่อมต่อไปยัง Google Sheets ของคุณโดยใช้ ID จากลิงก์
+        client = gspread.authorize(credentials)
+        spreadsheet = client.open_by_key("1jLkfy3S2c59GzliqEGltd9PdaV-ozKGkGiB488ueIPw")
+        worksheet = spreadsheet.sheet1
+        
+        # จัดรูปแบบข้อมูลให้พร้อมเขียน
+        rows_to_add = []
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        for r in results_data:
+            # ลบสัญลักษณ์ ฿ และ + ออก เพื่อให้ Excel คำนวณผลรวมได้ง่าย
+            profit_str = str(r.get('กำไร/ขาดทุน', '0')).replace(' ฿', '').replace('+', '')
+            
+            rows_to_add.append([
+                today_str,
+                r.get('ลีก', ''),
+                r.get('คู่บอล', ''),
+                r.get('สกอร์จริง', ''),
+                str(r.get('เดิมพัน', '0')).replace(' ฿', ''),
+                'ได้' if 'ได้' in str(r.get('ผลลัพธ์', '')) else 'เสีย',
+                profit_str
+            ])
+            
+        # เขียนข้อมูลแถวใหม่ลงไป
+        if rows_to_add:
+            worksheet.append_rows(rows_to_add)
+            return True
+        return False
+    except Exception as e:
+        st.error(f"❌ เกิดข้อผิดพลาดในการบันทึก Google Sheets: {e}")
+        return False
 
 # ==========================================
 # ฟังก์ชันคำนวณ (เหมือนเดิม)
@@ -198,7 +240,23 @@ with tab1:
         df_near = pd.DataFrame(st.session_state.near_misses); df_near = df_near.sort_values(by='คะแนน', ascending=False).head(3).reset_index(drop=True)
         st.dataframe(df_near, width="stretch", hide_index=True)
 
-
+            if results:
+                st.divider()
+                df_results = pd.DataFrame(results)
+                
+                # ... (ส่วนคำนวณ Metric และแสดงตารางเดิม) ...
+                c1.metric("คู่ที่แทง", len(df_results))
+                c2.metric("Win Rate", f"{win_rate:.1f}%")
+                c3.metric("ROI วันนี้", f"{roi:.2f}%", delta=f"{total_pl:.0f} ฿")
+                
+                st.dataframe(df_results, width="stretch", hide_index=True)
+                
+                # 🌟 เพิ่มปุ่มบันทึกลง Google Sheets
+                if st.button("💾 บันทึกผลลัพธ์นี้ลง Google Sheets", type="primary", use_container_width=True):
+                    if save_to_google_sheet(results):
+                        st.success("✅ บันทึกข้อมูลสำเร็จแล้ว! ลองเปิด Google Sheets ดูได้เลยครับ")
+                    else:
+                        st.error("เกิดข้อผิดพลาด ลองตรวจสอบ Secrets หรือสิทธิ์การแชร์ไฟล์")
 # ==========================================
 # TAB 2: สรุปผลเมื่อวาน (โค้ดใหม่)
 # ==========================================
