@@ -3,15 +3,21 @@ import requests
 import pandas as pd
 import time
 import io
-import gspread
-import json
 from datetime import datetime, timezone, timedelta
 from scipy.stats import poisson
+
+# ป้องกัน Segmentation fault บนเซิร์ฟเวอร์ฟรี
+try:
+    import gspread
+    import json
+    GSPREAD_AVAILABLE = True
+except Exception:
+    GSPREAD_AVAILABLE = False
 
 # ==========================================
 # ตั้งค่า API
 # ==========================================
-API_KEY = st.secrets.get("API_KEY", "ynl1sr2l6ljzaole") 
+API_KEY = st.secrets["API_KEY"] 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}", 
     "Accept": "application/json"
@@ -134,7 +140,7 @@ def save_to_google_sheet(results_data):
             return True
         return False
     except Exception as e:
-        st.error(f"❌ เกิดข้อผิดพลาดในการบันทึก Google Sheets: {e}")
+        st.error(f"❌ เกิดข้อผิดพลาดในการบันทึก: {e}")
         return False
 
 # ==========================================
@@ -234,7 +240,7 @@ with tab1:
         st.dataframe(df_near, width="stretch", hide_index=True)
 
 # ==========================================
-# TAB 2 (แก้เยื้องให้เรียบร้อยแล้ว + เพิ่มลีก)
+# TAB 2
 # ==========================================
 with tab2:
     st.markdown("### 📈 ระบบทดสอบย้อนหลัง (Backtesting)")
@@ -323,10 +329,14 @@ with tab2:
                 
                 st.dataframe(df_results, width="stretch", hide_index=True)
                 
-                if st.button("💾 บันทึกผลลัพธ์นี้ลง Google Sheets", type="primary", use_container_width=True):
-                    if save_to_google_sheet(results):
-                        st.success("✅ บันทึกข้อมูลสำเร็จแล้ว! ลองเปิด Google Sheets ดูได้เลยครับ")
-                    else:
-                        st.error("เกิดข้อผิดพลาด ลองตรวจสอบ Secrets หรือสิทธิ์การแชร์ไฟล์")
+                # จะแสดงปุ่มบันทึกก็ต่อเมื่อ GSPREAD_AVAILABLE เป็น True เท่านั้น
+                if GSPREAD_AVAILABLE:
+                    if st.button("💾 บันทึกผลลัพธ์นี้ลง Google Sheets", type="primary", use_container_width=True):
+                        if save_to_google_sheet(results):
+                            st.success("✅ บันทึกข้อมูลสำเร็จแล้ว! ลองเปิด Google Sheets ดูได้เลยครับ")
+                        else:
+                            st.error("เกิดข้อผิดพลาด ลองตรวจสอบ Secrets หรือสิทธิ์การแชร์ไฟล์")
+                else:
+                    st.info("ℹ️ ฟีเจอร์บันทึก Google Sheets ถูกปิดเพราะข้อจำกัดของเซิร์ฟเวอร์ฟรี (แนะนำให้ใช้ปุ่มดาวน์โหลด CSV แทน)")
             else:
                 st.warning("เมื่อวานไม่มีคู่ไหนผ่านเกณฑ์เลยครับ")
