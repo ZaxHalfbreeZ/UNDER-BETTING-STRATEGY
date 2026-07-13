@@ -11,11 +11,8 @@ from scipy.stats import poisson
 # ==========================================
 API_KEY = st.secrets["API_KEY"] 
 HEADERS = {
-    "จริง".Authorization": f"Bearer {API_KEY}", 
+    "Authorization": f"Bearer {API_KEY}", 
     "Accept": "application/json"
-}
-LIST_URL = f"https://api.sstats.net/games/list?name={datetime.now().strftime('%Y-%m-%d')}"
-STATS_URL_FORMAT = "https://api.sstats.net/games/glicko/{}" 
 
 # ==========================================
 # ฟังก์ชันคำนวณ (ไม่ต้องแก้ไข)
