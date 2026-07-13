@@ -13,6 +13,7 @@ API_KEY = st.secrets["API_KEY"]
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}", 
     "Accept": "application/json"
+}
 
 # ==========================================
 # ฟังก์ชันคำนวณ (ไม่ต้องแก้ไข)
