@@ -185,7 +185,7 @@ with tab1:
         with debug_box:
             st.write("**URL ที่ส่งไปหา API:**", LIST_URL)
         
-                with st.spinner('กำลังดึงรายการแมตช์... (หากนานอาจเกิดจากเซิร์ฟเวอร์ API ช้า)...'):
+    with st.spinner('กำลังดึงรายการแมตช์... (หากนานอาจเกิดจากเซิร์ฟเวอร์ API ช้า)...'):
             try:
                 # เพิ่มระบบ Retry ลองใหม่ 3 ครั้ง
                 max_retries = 3
