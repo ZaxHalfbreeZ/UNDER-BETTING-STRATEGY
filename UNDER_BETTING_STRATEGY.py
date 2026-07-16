@@ -185,9 +185,22 @@ with tab1:
         with debug_box:
             st.write("**URL ที่ส่งไปหา API:**", LIST_URL)
         
-        with st.spinner('กำลังดึงรายการแมตช์...'):
+                with st.spinner('กำลังดึงรายการแมตช์... (หากนานอาจเกิดจากเซิร์ฟเวอร์ API ช้า)...'):
             try:
-                res = requests.get(LIST_URL, headers=HEADERS, timeout=10)
+                # เพิ่มระบบ Retry ลองใหม่ 3 ครั้ง
+                max_retries = 3
+                res = None
+                for attempt in range(max_retries):
+                    try:
+                        # เพิ่ม timeout เป็น 30 วินาที
+                        res = requests.get(LIST_URL, headers=HEADERS, timeout=30)
+                        if res.status_code == 200:
+                            break # ถ้าสำเร็จ ให้ออกลูป
+                    except requests.exceptions.Timeout:
+                        if attempt < max_retries - 1:
+                            time.sleep(3) # รอ 3 วิ แล้วลองใหม่
+                        else:
+                            raise Exception("หมดเวลาเชื่อมต่อหลังจากพยายาม 3 ครั้ง")
                 
                 # แสดงสถานะและข้อมูลดิบในกล่อง Debug
                 with debug_box:
@@ -197,6 +210,20 @@ with tab1:
                         st.json(res.json())
                     except:
                         st.text(res.text)
+                
+                # ตรวจสอบว่า API ตอบกลับมาสำเร็จหรือไม่
+                if res.status_code == 200:
+                    res_list = res.json()
+                    games = res_list.get('data', [])
+                    games = [g for g in games if g.get('statusName', '').lower() not in ['finished', 'cancelled', 'postponed']]
+                else:
+                    st.error(f"❌ เกิดข้อผิดพลาด: API ตอบกลับมาด้วย Status {res.status_code}")
+                    games = []
+                    
+            except Exception as e:
+                with debug_box:
+                    st.error(f"❌ ไม่สามารถเชื่อมต่อกับ API ได้: {e}")
+                games = []
                 
                 # ตรวจสอบว่า API ตอบกลับมาสำเร็จหรือไม่
                 if res.status_code == 200:
