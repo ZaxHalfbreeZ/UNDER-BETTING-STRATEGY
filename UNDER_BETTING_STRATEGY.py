@@ -78,7 +78,7 @@ def format_match_time(date_str):
     try:
         dt = datetime.fromisoformat(date_str)
         dt = dt.replace(tzinfo=timezone.utc)
-        # ✅ แก้ไข: เปลี่ยนจาก hours=4 เป็น hours=7 (เวลาไทยจริง)
+        # ✅ แก้ไขเวลาไทยจริง (GMT+7)
         thai_tz = timezone(timedelta(hours=7))
         dt_thai = dt.astimezone(thai_tz)
         return dt_thai.strftime("%H:%M")
@@ -165,7 +165,7 @@ st.title("🚀 UNDER BOT - Pro Backtesting Edition")
 tab1, tab2 = st.tabs(["🔍 สแกนคู่วันนี้", "📊 สรุปผลเมื่อวาน (Backtest)"])
 
 # ==========================================
-# TAB 1
+# TAB 1 (พร้อมระบบ Debug)
 # ==========================================
 with tab1:
     with st.expander("⚙️ ตั้งค่าเกณฑ์การคัดกรอง", expanded=False):
@@ -180,15 +180,40 @@ with tab1:
         LIST_URL = f"https://api.sstats.net/games/list?date={datetime.now().strftime('%Y-%m-%d')}"
         STATS_URL_FORMAT = "https://api.sstats.net/games/glicko/{}" 
         
+        # --- ส่วนแสดงผล Debug ---
+        debug_box = st.expander("🔧 Debug Mode: ตรวจสอบการตอบกลับของ API", expanded=True)
+        with debug_box:
+            st.write("**URL ที่ส่งไปหา API:**", LIST_URL)
+        
         with st.spinner('กำลังดึงรายการแมตช์...'):
             try:
-                res_list = requests.get(LIST_URL, headers=HEADERS, timeout=10).json()
-                games = res_list.get('data', [])
-                games = [g for g in games if g.get('statusName', '').lower() not in ['finished', 'cancelled', 'postponed']]
-            except: games = []
+                res = requests.get(LIST_URL, headers=HEADERS, timeout=10)
+                
+                # แสดงสถานะและข้อมูลดิบในกล่อง Debug
+                with debug_box:
+                    st.write("**HTTP Status Code:**", res.status_code)
+                    st.write("**ข้อมูลดิบที่ได้รับ:**")
+                    try:
+                        st.json(res.json())
+                    except:
+                        st.text(res.text)
+                
+                # ตรวจสอบว่า API ตอบกลับมาสำเร็จหรือไม่
+                if res.status_code == 200:
+                    res_list = res.json()
+                    games = res_list.get('data', [])
+                    games = [g for g in games if g.get('statusName', '').lower() not in ['finished', 'cancelled', 'postponed']]
+                else:
+                    st.error(f"❌ เกิดข้อผิดพลาด: API ตอบกลับมาด้วย Status {res.status_code}")
+                    games = []
+                    
+            except Exception as e:
+                with debug_box:
+                    st.error(f"❌ ไม่สามารถเชื่อมต่อกับ API ได้: {e}")
+                games = []
 
         if not games:
-            st.warning("ไม่พบแมตช์ที่กำลังจะแข่งในวันนี้")
+            st.warning("ไม่พบแมตช์ที่กำลังจะแข่งในวันนี้ (หรืออาจจะเกิดจาก Error ข้างต้น)")
             st.session_state.approved_matches = []
         else:
             st.info(f"พบ {len(games)} คู่ กำลังวิเคราะห์...")
@@ -334,7 +359,6 @@ with tab2:
                 
                 st.dataframe(df_results, width="stretch", hide_index=True)
                 
-                # จะแสดงปุ่มบันทึกก็ต่อเมื่อ GSPREAD_AVAILABLE เป็น True เท่านั้น
                 if GSPREAD_AVAILABLE:
                     if st.button("💾 บันทึกผลลัพธ์นี้ลง Google Sheets", type="primary", use_container_width=True):
                         if save_to_google_sheet(results):
