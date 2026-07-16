@@ -78,7 +78,6 @@ def format_match_time(date_str):
     try:
         dt = datetime.fromisoformat(date_str)
         dt = dt.replace(tzinfo=timezone.utc)
-        # ✅ แก้ไขเวลาไทยจริง (GMT+7)
         thai_tz = timezone(timedelta(hours=7))
         dt_thai = dt.astimezone(thai_tz)
         return dt_thai.strftime("%H:%M")
@@ -165,7 +164,7 @@ st.title("🚀 UNDER BOT - Pro Backtesting Edition")
 tab1, tab2 = st.tabs(["🔍 สแกนคู่วันนี้", "📊 สรุปผลเมื่อวาน (Backtest)"])
 
 # ==========================================
-# TAB 1 (พร้อมระบบ Debug)
+# TAB 1
 # ==========================================
 with tab1:
     with st.expander("⚙️ ตั้งค่าเกณฑ์การคัดกรอง", expanded=False):
@@ -180,29 +179,25 @@ with tab1:
         LIST_URL = f"https://api.sstats.net/games/list?date={datetime.now().strftime('%Y-%m-%d')}"
         STATS_URL_FORMAT = "https://api.sstats.net/games/glicko/{}" 
         
-        # --- ส่วนแสดงผล Debug ---
         debug_box = st.expander("🔧 Debug Mode: ตรวจสอบการตอบกลับของ API", expanded=True)
         with debug_box:
             st.write("**URL ที่ส่งไปหา API:**", LIST_URL)
         
-    with st.spinner('กำลังดึงรายการแมตช์... (หากนานอาจเกิดจากเซิร์ฟเวอร์ API ช้า)...'):
+        with st.spinner('กำลังดึงรายการแมตช์... (กำลังพยายามเชื่อมต่อหลายรอบ)...'):
             try:
-                # เพิ่มระบบ Retry ลองใหม่ 3 ครั้ง
                 max_retries = 3
                 res = None
                 for attempt in range(max_retries):
                     try:
-                        # เพิ่ม timeout เป็น 30 วินาที
                         res = requests.get(LIST_URL, headers=HEADERS, timeout=30)
                         if res.status_code == 200:
-                            break # ถ้าสำเร็จ ให้ออกลูป
+                            break
                     except requests.exceptions.Timeout:
                         if attempt < max_retries - 1:
-                            time.sleep(3) # รอ 3 วิ แล้วลองใหม่
+                            time.sleep(3)
                         else:
                             raise Exception("หมดเวลาเชื่อมต่อหลังจากพยายาม 3 ครั้ง")
                 
-                # แสดงสถานะและข้อมูลดิบในกล่อง Debug
                 with debug_box:
                     st.write("**HTTP Status Code:**", res.status_code)
                     st.write("**ข้อมูลดิบที่ได้รับ:**")
@@ -211,21 +206,6 @@ with tab1:
                     except:
                         st.text(res.text)
                 
-                # ตรวจสอบว่า API ตอบกลับมาสำเร็จหรือไม่
-                if res.status_code == 200:
-                    res_list = res.json()
-                    games = res_list.get('data', [])
-                    games = [g for g in games if g.get('statusName', '').lower() not in ['finished', 'cancelled', 'postponed']]
-                else:
-                    st.error(f"❌ เกิดข้อผิดพลาด: API ตอบกลับมาด้วย Status {res.status_code}")
-                    games = []
-                    
-            except Exception as e:
-                with debug_box:
-                    st.error(f"❌ ไม่สามารถเชื่อมต่อกับ API ได้: {e}")
-                games = []
-                
-                # ตรวจสอบว่า API ตอบกลับมาสำเร็จหรือไม่
                 if res.status_code == 200:
                     res_list = res.json()
                     games = res_list.get('data', [])
