@@ -6,6 +6,11 @@ import io
 from datetime import datetime, timezone, timedelta
 from scipy.stats import poisson
 
+# ==========================================
+# ตั้งค่าหน้าเว็บ (ต้องอยู่หลัง import ทันที)
+# ==========================================
+st.set_page_config(page_title="Under Bot v2.0", page_icon="🚀", layout="wide")
+
 # ป้องกัน Segmentation fault บนเซิร์ฟเวอร์ฟรี
 try:
     import gspread
@@ -73,7 +78,8 @@ def format_match_time(date_str):
     try:
         dt = datetime.fromisoformat(date_str)
         dt = dt.replace(tzinfo=timezone.utc)
-        thai_tz = timezone(timedelta(hours=4))
+        # ✅ แก้ไข: เปลี่ยนจาก hours=4 เป็น hours=7 (เวลาไทยจริง)
+        thai_tz = timezone(timedelta(hours=7))
         dt_thai = dt.astimezone(thai_tz)
         return dt_thai.strftime("%H:%M")
     except:
@@ -154,7 +160,6 @@ if 'near_misses' not in st.session_state:
 # ==========================================
 # UI หลัก
 # ==========================================
-st.set_page_config(page_title="Under Bot v2.0", page_icon="🚀", layout="wide")
 st.title("🚀 UNDER BOT - Pro Backtesting Edition")
 
 tab1, tab2 = st.tabs(["🔍 สแกนคู่วันนี้", "📊 สรุปผลเมื่อวาน (Backtest)"])
