@@ -78,7 +78,7 @@ def format_match_time(date_str):
     try:
         dt = datetime.fromisoformat(date_str)
         dt = dt.replace(tzinfo=timezone.utc)
-        thai_tz = timezone(timedelta(hours=7))
+        thai_tz = timezone(timedelta(hours=4))
         dt_thai = dt.astimezone(thai_tz)
         return dt_thai.strftime("%H:%M")
     except:
