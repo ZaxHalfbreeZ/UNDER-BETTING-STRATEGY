@@ -7,10 +7,10 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from scipy.stats import poisson
 
-st.set_page_config(page_title="Under Bot v3.0", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="Under Bot v3.1", page_icon="🚀", layout="wide")
 
 # ==========================================
-# ตั้งค่าฐานข้อมูล SQLite (จะสร้างไฟล์ .db ให้อัตโนมัติ)
+# ตั้งค่าฐานข้อมูล SQLite
 # ==========================================
 def init_db():
     conn = sqlite3.connect('betting_log.db')
@@ -49,7 +49,6 @@ def update_bet_result(bet_id, status, profit):
     conn.commit()
     conn.close()
 
-# เรียกใช้งาน DB ทันทีเมื่อเปิดแอป
 init_db()
 
 # ==========================================
@@ -99,7 +98,7 @@ def format_match_time(date_str):
     if not date_str: return "N/A"
     try:
         dt = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
-        thai_tz = timezone(timedelta(hours=4)) # ตั้งค่าตรงนี้ตามที่คุณต้องการ
+        thai_tz = timezone(timedelta(hours=4)) 
         return dt.astimezone(thai_tz).strftime("%H:%M")
     except: return "N/A"
 
@@ -129,14 +128,21 @@ def create_excel_with_formula(df_edited, current_bankroll):
     return output
 
 # ==========================================
+# ✅ ส่วนสำคัญ: เตรียมหน่วยความจำ (Session State) ให้พร้อม
+# ==========================================
+if 'scan_results' not in st.session_state:
+    st.session_state.scan_results = []
+if 'near_misses' not in st.session_state:
+    st.session_state.near_misses = []
+
+# ==========================================
 # UI หลัก
 # ==========================================
 st.title("🚀 UNDER BOT - Smart Logging Edition")
-
 tab1, tab2 = st.tabs(["🔍 สแกน & บันทึกคู่วันนี้", "📊 ตรวจสอบผลรางวัลเมื่อวาน"])
 
 # ==========================================
-# TAB 1: สแกนแล้วเก็บเข้าฐานข้อมูลทันที
+# TAB 1
 # ==========================================
 with tab1:
     with st.expander("⚙️ ตั้งค่าเกณฑ์การคัดกรอง", expanded=False):
@@ -145,7 +151,8 @@ with tab1:
         with col2: xg_target = st.slider("📊 ค่า xG รวมสูงสุดที่ยอมรับ", min_value=2.0, max_value=3.5, value=2.6, step=0.1)
         bankroll = st.number_input("💰 เงินทุนทั้งหมด (บาท)", min_value=100, value=5000, step=100)
 
-    if st.button("🔍 เริ่มค้นหาและบันทึกคู่เกมวันนี้", type="primary", use_container_width=True):
+    # ❌ ขั้นตอนที่ 1: ถ้ากดปุ่ม ให้ "ทำงานหนัก" แล้วเก็บผลลัพธ์เข้า Session State
+    if st.button("🔍 เริ่มค้นหาคู่เกมวันนี้", type="primary", use_container_width=True):
         today_str = datetime.now().strftime('%Y-%m-%d')
         LIST_URL = f"https://api.sstats.net/games/list?date={today_str}"
         STATS_URL_FORMAT = "https://api.sstats.net/games/glicko/{}" 
@@ -158,6 +165,7 @@ with tab1:
 
         if not games:
             st.warning("ไม่พบแมตช์ที่กำลังจะแข่งในวันนี้")
+            st.session_state.scan_results = []
         else:
             st.info(f"พบ {len(games)} คู่ กำลังวิเคราะห์...")
             temp_approved = []; temp_near = []
@@ -187,57 +195,66 @@ with tab1:
                     elif score >= (score_target - 10): temp_near.append(match_data)
                     time.sleep(0.5)
                 except: time.sleep(1); continue
+            
             progress_bar.empty(); progress_text.empty()
+            # ✅ ส่วนสำคัญ: เก็บข้อมูลเข้า Memory แทนที่จะแสดงตรงนี้
+            st.session_state.scan_results = temp_approved
+            st.session_state.near_misses = temp_near
 
-            # ✅ แสดงผลปกติ
-            if temp_approved:
-                st.divider(); st.success(f"🎯 พบ **{len(temp_approved)} คู่** ที่ผ่านเกณฑ์!")
-                df = pd.DataFrame(temp_approved); df = df.sort_values(by='คะแนน', ascending=False).reset_index(drop=True)
-                edited_df = st.data_editor(df, disabled=["⏰ เวลา", "🏆 ลีก", "ทีมเหย้า", "ทีมเยือน", "xG รวม", "Poisson U2.5 (%)", "คะแนน"], width="stretch", height=400, hide_index=True)
-                
-                # ✅ คำนวณเงินแทง
-                final_bets_to_save = []
-                for index, row in edited_df.iterrows():
-                    odds = row['✏️ Odds U2.5']; prob = row['Poisson U2.5 (%)']
-                    if odds >= 1.50: 
-                        stake_pct, bet_amount = calculate_kelly_stake(odds, prob, bankroll)
-                        if bet_amount > 0: 
-                            row['stake_amount'] = bet_amount
-                            final_bets_to_save.append(row)
-                            
-                if final_bets_to_save:
-                    df_bets = pd.DataFrame(final_bets_to_save)[['ทีมเหย้า', 'ทีมเยือน', '✏️ Odds U2.5', 'stake_amount']].rename(columns={'stake_amount': '💰 แทง (บาท)'})
-                    df_bets['💰 แทง (บาท)'] = df_bets['💰 แทง (บาท)'].apply(lambda x: f"{x:.0f} ฿")
-                    st.dataframe(df_bets, width="stretch", hide_index=True)
+    # ✅ ขั้นตอนที่ 2: แสดงผลตาราง "ข้างนอก" ปุ่มกด (จะไม่หายแม้คุณจะพิมพ์แก้ไข)
+    if st.session_state.scan_results:
+        st.divider(); st.success(f"🎯 พบ **{len(st.session_state.scan_results)} คู่** ที่ผ่านเกณฑ์! (สามารถแก้ไขตัวเลขได้เลย)")
+        df = pd.DataFrame(st.session_state.scan_results)
+        df = df.sort_values(by='คะแนน', ascending=False).reset_index(drop=True)
+        
+        # ตารางนี้จะอ่านค่าจาก Session State มาแสดง พอคุณแก้ค่า มันจะเก็บค่าใหม่ไว้ใน edited_df
+        edited_df = st.data_editor(df, disabled=["⏰ เวลา", "🏆 ลีก", "ทีมเหย้า", "ทีมเยือน", "xG รวม", "Poisson U2.5 (%)", "คะแนน"], width="stretch", height=400, hide_index=True)
+        
+        # คำนวณเงินแทงจากค่าที่ถูกแก้ไขแล้ว
+        final_bets_to_save = []
+        for index, row in edited_df.iterrows():
+            odds = row['✏️ Odds U2.5']; prob = row['Poisson U2.5 (%)']
+            if odds >= 1.50: 
+                stake_pct, bet_amount = calculate_kelly_stake(odds, prob, bankroll)
+                if bet_amount > 0: 
+                    row['stake_amount'] = bet_amount
+                    final_bets_to_save.append(row)
                     
-                    excel_file = create_excel_with_formula(edited_df, bankroll)
-                    if excel_file:
-                        st.download_button(label="📥 ดาวน์โหลดไฟล์ Excel", data=excel_file, file_name=f'Under_Bet_{today_str}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        if final_bets_to_save:
+            df_bets = pd.DataFrame(final_bets_to_save)[['ทีมเหย้า', 'ทีมเยือน', '✏️ Odds U2.5', 'stake_amount']].rename(columns={'stake_amount': '💰 แทง (บาท)'})
+            df_bets['💰 แทง (บาท)'] = df_bets['💰 แทง (บาท)'].apply(lambda x: f"{x:.0f} ฿")
+            st.dataframe(df_bets, width="stretch", hide_index=True)
+            
+            excel_file = create_excel_with_formula(edited_df, bankroll)
+            if excel_file:
+                st.download_button(label="📥 ดาวน์โหลดไฟล์ Excel", data=excel_file, file_name=f'Under_Bet_{datetime.now().strftime("%Y-%m-%d")}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-                    # ✅✅ ส่วนสำคัญ: กดปุ่มเพื่อยืนยันการบันทึกลง Database
-                    if st.button("💾 ยืนยันการบันทึกคู่เหล่านี้เพื่อตรวจสอบผลวันพรุ่ง", type="secondary", use_container_width=True):
-                        save_bets_to_db(final_bets_to_save, today_str)
-                        st.success("✅ บันทึกลงระบบสำเร็จแล้ว! พรุ่งนี้มากด Tab 2 เพื่อดูผลลัพธ์ได้เลย")
-                else: st.warning("กรุณาใส่เลข Odds ที่มากกว่า 1.50")
+            if st.button("💾 ยืนยันการบันทึกคู่เหล่านี้เพื่อตรวจสอบผลวันพรุ่ง", type="secondary", use_container_width=True):
+                today_str = datetime.now().strftime('%Y-%m-%d')
+                save_bets_to_db(final_bets_to_save, today_str)
+                st.success("✅ บันทึกลงระบบสำเร็จแล้ว! พรุ่งนี้มากด Tab 2 เพื่อดูผลลัพธ์ได้เลย")
+                st.session_state.scan_results = [] # ล้างตารางหลังบันทึก
+        else: 
+            st.warning("กรุณาใส่เลข Odds ที่มากกว่า 1.50 เพื่อคำนวณเงินแทง")
 
-            if temp_near:
-                st.divider(); st.warning(f"⚠️ คู่ที่ใกล้เคียงเกณฑ์")
-                df_near = pd.DataFrame(temp_near); df_near = df_near.sort_values(by='คะแนน', ascending=False).head(3).reset_index(drop=True)
-                st.dataframe(df_near, width="stretch", hide_index=True)
+    if st.session_state.near_misses:
+        st.divider(); st.warning(f"⚠️ คู่ที่ใกล้เคียงเกณฑ์")
+        df_near = pd.DataFrame(st.session_state.near_misses)
+        df_near = df_near.sort_values(by='คะแนน', ascending=False).head(3).reset_index(drop=True)
+        st.dataframe(df_near, width="stretch", hide_index=True)
 
 
 # ==========================================
-# TAB 2: ดึงเฉพาะคู่ที่บันทึกไว้มาเช็คผล
+# TAB 2
 # ==========================================
 with tab2:
     st.markdown("### 📈 ระบบตรวจสอบผลแทง (จากคู่ที่คุณบันทึกไว้จริงๆ)")
     yesterday_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     
-    # ดึงข้อมูลจาก DB
     pending_df = get_pending_bets(yesterday_date)
     
     if pending_df.empty:
-        st.info(f"ไม่มีคู่บอลที่รอตรวจสอบผลสำหรับวันที่ {yesterday_date} (อาจจะยังไม่ได้กดบันทึกจาก Tab 1 เมื่อวาน หรือตรวจสอบผลไปแล้ว)")
+        st.info(f"ไม่มีคู่บอลที่รอตรวจสอบผลสำหรับวันที่ {yesterday_date}")
     else:
         st.warning(f"พบ {len(pending_df)} คู่ที่บันทึกไว้เมื่อวาน กำลังดึงสกอร์จริงมาเปรียบเทียบ...")
         
@@ -246,7 +263,6 @@ with tab2:
             progress_text = st.empty(); progress_bar = st.progress(0)
             LIST_URL_YEST = f"https://api.sstats.net/games/list?date={yesterday_date}"
             
-            # ดึงข้อมูลแมตช์เมื่อวานทั้งหมดมาไว้ match กับ game_id
             try:
                 res_list = requests.get(LIST_URL_YEST, headers=HEADERS, timeout=15).json()
                 all_yesterday_games = {str(g.get('id')): g for g in res_list.get('data', []) if g.get('statusName', '').lower() == 'finished'}
@@ -266,15 +282,13 @@ with tab2:
                     profit_loss = (row['stake'] * (row['odds'] - 1)) if is_win else -row['stake']
                     
                     status_str = '✅ ได้' if is_win else '❌ เสีย'
-                    
-                    # ✅ อัปเดตสถานะใน DB ทันที
                     update_bet_result(row['id'], 'won' if is_win else 'lost', profit_loss)
                     
                     results.append({
                         '🏆 ลีก': row['league'],
                         'คู่บอล': f"{row['home']} vs {row['away']}",
                         'สกอร์จริง': f"{home_ft}-{away_ft} (รวม {total_goals})",
-                        '💰 เดิมพัน(จากสมมติฐาน)': f"{row['stake']:.0f} ฿",
+                        '💰 เดิมพัน': f"{row['stake']:.0f} ฿",
                         'ผลลัพธ์': status_str,
                         'กำไร/ขาดทุน': f"{'+' if profit_loss > 0 else ''}{profit_loss:.0f} ฿"
                     })
@@ -283,7 +297,7 @@ with tab2:
                         '🏆 ลีก': row['league'],
                         'คู่บอล': f"{row['home']} vs {row['away']}",
                         'สกอร์จริง': 'ไม่พบข้อมูล (อาจเลื่อน)',
-                        '💰 เดิมพัน(จากสมมติฐาน)': f"{row['stake']:.0f} ฿",
+                        '💰 เดิมพัน': f"{row['stake']:.0f} ฿",
                         'ผลลัพธ์': '⏸️ ไม่แข่ง',
                         'กำไร/ขาดทุน': '0 ฿'
                     })
@@ -295,13 +309,12 @@ with tab2:
                 st.divider()
                 df_results = pd.DataFrame(results)
                 
-                # คำนวณสถิติ (ยกเว้นคู่ที่ไม่แข่ง)
                 valid_results = [r for r in results if 'ไม่แข่ง' not in r['ผลลัพธ์']]
                 if valid_results:
                     total_pl = sum([float(str(p).replace(' ฿','').replace('+','')) for p in [r['กำไร/ขาดทุน'] for r in valid_results]])
                     wins = len([r for r in valid_results if 'ได้' in r['ผลลัพธ์']])
                     win_rate = (wins / len(valid_results)) * 100
-                    total_staked = sum([float(str(s).replace(' ฿','')) for s in [r['💰 เดิมพัน(จากสมมติฐาน)'] for r in valid_results]])
+                    total_staked = sum([float(str(s).replace(' ฿','')) for s in [r['💰 เดิมพัน'] for r in valid_results]])
                     roi = (total_pl / total_staked) * 100 if total_staked > 0 else 0
                     
                     c1, c2, c3 = st.columns(3)
