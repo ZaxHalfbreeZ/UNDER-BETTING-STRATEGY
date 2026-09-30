@@ -311,15 +311,35 @@ with tab1:
         STATS_URL_FORMAT = "https://api.sstats.net/games/glicko/{}"
 
         with st.spinner('กำลังดึงรายการแมตช์...'):
+            games = []; api_error = ''; raw_count = 0; filtered_out = 0
             try:
-                res_list = requests.get(LIST_URL, headers=HEADERS, timeout=30).json()
-                games = [g for g in res_list.get('data', []) if g.get('statusName', '').lower() not in ['finished', 'cancelled', 'postponed']]
-            except: games = []
+                res = requests.get(LIST_URL, headers=HEADERS, timeout=30)
+                if res.status_code != 200:
+                    api_error = f"HTTP {res.status_code} — {res.text[:200]}"
+                else:
+                    data = res.json().get('data')
+                    if not isinstance(data, list):
+                        api_error = f"การตอบกลับผิดรูปแบบ: {str(data)[:200]}"
+                    else:
+                        raw_count = len(data)
+                        games = [g for g in data if g.get('statusName', '').lower() not in ['finished', 'cancelled', 'postponed']]
+                        filtered_out = raw_count - len(games)
+            except requests.exceptions.RequestException as e:
+                api_error = f"เชื่อมต่อไม่สำเร็จ: {type(e).__name__}: {e}"
+            except ValueError as e:
+                api_error = f"API ตอบกลับไม่ใช่ JSON: {e}"
 
         temp_approved = []; temp_near = []; temp_watch = []
 
         if not games:
             st.warning("ไม่พบแมตช์ที่กำลังจะแข่งในวันนี้")
+            if api_error:
+                st.error(f"**สาเหตุที่ตรวจพบ (ฝั่ง API):** {api_error}")
+                st.caption("401 = คีย์ไม่ถูกต้อง/หมดอายุ · 402/403 = โควต้าหมดหรือสิทธิ์แพ็กเกจไม่ครอบคลุม · 429 = เรียกถี่เกินขีดจำกัด · 5xx = เซิร์ฟเวอร์ฝั่ง API มีปัญหา")
+            elif raw_count > 0:
+                st.info(f"API ส่งรายการมา {raw_count} คู่ แต่ทั้งหมดมีสถานะจบแล้ว/ยกเลิก/เลื่อน ({filtered_out} คู่) — ลองสแกนช่วงก่อนเกมเตะ หรือตรวจว่าวันที่ที่ถาม API ตรงกับวันแข่งจริงไหม")
+            else:
+                st.info("API ตอบกลับปกติแต่รายการว่างเปล่า — อาจเป็นช่วงที่ API ยังไม่อัปเดตโปรแกรมของวันนี้ ลองใหม่ภายหลัง")
         else:
             st.info(f"พบ {len(games)} คู่ · โหมด: {MODE_LABEL[scan_mode]} — กำลังวิเคราะห์...")
             progress_text = st.empty(); progress_bar = st.progress(0)
