@@ -343,6 +343,7 @@ with tab1:
         else:
             st.info(f"พบ {len(games)} คู่ · โหมด: {MODE_LABEL[scan_mode]} — กำลังวิเคราะห์...")
             progress_text = st.empty(); progress_bar = st.progress(0)
+            games_with_prices = 0
 
             for index, g in enumerate(games):
                 game_id = str(g.get('id')); league = g.get('season', {}).get('league', {}).get('name', 'Unknown')
@@ -360,7 +361,10 @@ with tab1:
                     league_display = f"{country} - {league}" if country else league
 
                     # ราคาจริงทุกเส้นจากฟีด — กรองตามโหมดและราคาต่ำสุดที่ยอมรับ
-                    prices = [p for p in parse_market_prices(g)
+                    all_prices = parse_market_prices(g)
+                    if all_prices:
+                        games_with_prices += 1
+                    prices = [p for p in all_prices
                               if p['odds'] >= min_odds and p['side'] in sides_to_scan]
                     if prices:
                         cands = []
@@ -399,6 +403,7 @@ with tab1:
                 except: time.sleep(1); continue
 
             progress_bar.empty(); progress_text.empty()
+            st.info(f"📊 สรุป: {len(games)} คู่ · มีราคาตลาดจริงในฟีด {games_with_prices} คู่ · ผ่านเกณฑ์ {len(temp_approved)} · ใกล้เคียง {len(temp_near)} · รอราคา {len(temp_watch)}")
 
         # ✅ เก็บข้อมูลเข้า Memory แทนที่จะแสดงตรงนี้
         st.session_state.scan_results = temp_approved
@@ -454,8 +459,8 @@ with tab1:
         st.dataframe(df_near, width="stretch", hide_index=True)
 
     if st.session_state.watchlist:
-        with st.expander(f"👀 คู่ที่โมเดลเห็นสถานการณ์ไม่ธรรมดาแต่ยังไม่มีราคาตลาด ({len(st.session_state.watchlist)} คู่)", expanded=False):
-            st.caption("รอจนกว่าเว็บจะเปิดราคาแล้วเทียบกับ 'ราคาที่ควรรับ' — ถ้าราคาจริงดีกว่าที่แสดงจึงค่อยพิจารณา (กดสแกนใหม่เพื่ออัปเดต)")
+        with st.expander(f"👀 คู่ที่โมเดลเห็นสถานการณ์ไม่ธรรมดาแต่ยังไม่มีราคาตลาดที่ใช้ได้ ({len(st.session_state.watchlist)} คู่)", expanded=False):
+            st.caption("ราคาที่ควรรับ = เส้นคุ้มทุนแบบอนุรักษ์นิยม (สมมติ xG เพี้ยนทางร้ายตาม Stress Test แล้ว) — รอจนกว่าเว็บจะเปิดราคาแล้วเทียบ ถ้าราคาจริงดีกว่าที่แสดงจึงค่อยพิจารณา (กดสแกนใหม่เพื่ออัปเดต)")
             df_watch = pd.DataFrame(st.session_state.watchlist)
             df_watch = df_watch.sort_values(by='xG รวม', key=lambda s: (s - 2.7).abs(), ascending=False).head(8).reset_index(drop=True)
             st.dataframe(df_watch, width="stretch", hide_index=True)
