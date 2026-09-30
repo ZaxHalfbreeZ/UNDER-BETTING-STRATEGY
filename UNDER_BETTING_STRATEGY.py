@@ -6,6 +6,7 @@ Dependencies: streamlit, requests, pandas, scipy, xlsxwriter
 
 v4.1: ไม่ตรึงเส้น 2.5 — สแกนทุกเส้น Under/Over ที่ตลาดเปิดราคา (1.5, 2.5, 3.5, ...)
 แล้วเลือกเส้นที่ให้ EV สูงสุดของแต่ละคู่ คัดเฉพาะคู่ที่มีราคาตลาดจริงยืนยัน
+ราคาดึงจาก /Odds/{gameId} (ทุกเจ้ามือ เลือกราคาดีที่สุดต่อเส้น) + ฟีดราคาในหน้ารายการ
 """
 import streamlit as st
 import requests
@@ -198,6 +199,37 @@ def parse_market_prices(game_data):
         pass
     return list(best_price.values())
 
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_prematch_odds(game_id):
+    """ดึงราคาก่อนแข่งจาก /Odds/{gameId} (ทุกเจ้ามือ) — แคช 15 นาที ประหยัดโควต้าเวลาสแกนซ้ำ"""
+    try:
+        res = requests.get(f"https://api.sstats.net/Odds/{game_id}", headers=HEADERS, timeout=10)
+        if res.status_code != 200:
+            return None
+        data = res.json().get('data')
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+def collect_bookmaker_prices(game_id, game_data):
+    """
+    รวมราคาจากทุกเจ้ามือ (Odds API) + ฟีดราคาที่แนบมากับหน้ารายการ
+    แล้วเก็บราคาดีที่สุด (สูงสุด) ต่อหนึ่งเส้นต่อหนึ่งฝั่ง — line shopping
+    """
+    merged = {}
+    def absorb(markets, bookmaker):
+        for p in parse_market_prices({'odds': markets}):
+            key = (p['line'], p['side'])
+            if key not in merged or p['odds'] > merged[key]['odds']:
+                merged[key] = {**p, 'bookmaker': bookmaker}
+    if isinstance(game_data, dict):
+        absorb(game_data.get('odds', []), 'รายการ')
+    bookmakers = fetch_prematch_odds(game_id)
+    if isinstance(bookmakers, list):
+        for b in bookmakers:
+            absorb(b.get('odds', []), b.get('bookmakerName', '?'))
+    return list(merged.values())
+
 def fair_line_suggestion(lambda_home, lambda_away, model_trust, stress_pct):
     """
     สำหรับคู่ที่ตลาดยังไม่เปิดราคา: แนะนำเส้นรอบๆ ผลรวม xG พร้อมราคาขั้นต่ำที่ควรรับ
@@ -291,6 +323,8 @@ with tab1:
         with sc2:
             stress_pct = st.slider("Stress Test: สมมติ xG คลาดเคลื่อน (%)", min_value=0, max_value=20, value=10, step=5,
                                    help="ตรวจว่าถ้า xG คลาดเคลื่อนไปทางร้ายตาม % นี้ (ฝั่งที่เสียเปรียบการแทงของเรา) เส้นนั้นจะยังคุ้มทุนอยู่ไหม — ไม่ผ่านด่านนี้จะไม่ถูกคัดเลย")
+        use_odds_api = st.checkbox("🔌 ดึงราคาก่อนแข่งจาก Odds API ทุกเจ้ามือ (แนะนำ — เพิ่ม 1 request/คู่ และแคช 15 นาที)", value=True,
+                                   help="รวมราคาจากทุกเจ้ามือแล้วใช้ราคาดีที่สุดต่อเส้น — ถ้าปิด จะใช้เฉพาะราคาที่แนบมากับหน้ารายการเท่านั้น (ซึ่งมักไม่มี)")
         st.markdown("🎚️ **เกณฑ์การคัดคู่** (ใช้กับทุกเส้น)")
         gc1, gc2, gc3 = st.columns(3)
         with gc1:
@@ -360,8 +394,8 @@ with tab1:
                     home_xg = float(home_xg); away_xg = float(away_xg); combined_xg = home_xg + away_xg
                     league_display = f"{country} - {league}" if country else league
 
-                    # ราคาจริงทุกเส้นจากฟีด — กรองตามโหมดและราคาต่ำสุดที่ยอมรับ
-                    all_prices = parse_market_prices(g)
+                    # ราคาจริงทุกเส้น — Odds API ทุกเจ้ามือ (เลือกราคาดีที่สุด) หรือเฉพาะฟีดหน้ารายการ
+                    all_prices = collect_bookmaker_prices(game_id, g) if use_odds_api else parse_market_prices(g)
                     if all_prices:
                         games_with_prices += 1
                     prices = [p for p in all_prices
@@ -383,7 +417,7 @@ with tab1:
                                       'ทีมเหย้า': home, 'ทีมเยือน': away, 'xG รวม': combined_xg,
                                       'Poisson (%)': round(best['p_raw'], 1),
                                       'P ปลอดภัย (%)': round(best['p_cons'], 1),
-                                      '✏️ Odds': best['odds'],
+                                      '✏️ Odds': best['odds'], 'เจ้ามือ': best.get('bookmaker', '—'),
                                       'EV (%)': round(best['ev'] * 100, 1), 'คะแนน': best['score'],
                                       'เกรด': grade_of(best['score']),
                                       'เส้นอื่นที่ใกล้เคียง': alt_text if alt_text else '—',
@@ -418,7 +452,7 @@ with tab1:
         df = pd.DataFrame(st.session_state.scan_results)
         df = df.sort_values(by='คะแนน', ascending=False).reset_index(drop=True)
 
-        edited_df = st.data_editor(df, disabled=["🎯 คำแนะนำ", "⏰ เวลา", "🏆 ลีก", "ทีมเหย้า", "ทีมเยือน", "xG รวม", "Poisson (%)", "P ปลอดภัย (%)", "EV (%)", "คะแนน", "เกรด", "เส้นอื่นที่ใกล้เคียง", "bet_type", "line", "game_id", "stake_amount"],
+        edited_df = st.data_editor(df, disabled=["🎯 คำแนะนำ", "⏰ เวลา", "🏆 ลีก", "ทีมเหย้า", "ทีมเยือน", "xG รวม", "Poisson (%)", "P ปลอดภัย (%)", "EV (%)", "คะแนน", "เกรด", "เส้นอื่นที่ใกล้เคียง", "เจ้ามือ", "bet_type", "line", "game_id", "stake_amount"],
                                    width="stretch", height=400, hide_index=True)
 
         # คำนวณเงินแทงจากค่าที่ถูกแก้ไขแล้ว — ใช้ P ปลอดภัยใน Kelly: ถ้า EV ติดลบ Kelly จะเป็นลบและตัดคู่นั้นทิ้งเอง
