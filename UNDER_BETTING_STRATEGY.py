@@ -377,7 +377,7 @@ with tab1:
         else:
             st.info(f"พบ {len(games)} คู่ · โหมด: {MODE_LABEL[scan_mode]} — กำลังวิเคราะห์...")
             progress_text = st.empty(); progress_bar = st.progress(0)
-            games_with_prices = 0
+            games_with_prices = 0; games_bad_prices = 0
 
             for index, g in enumerate(games):
                 game_id = str(g.get('id')); league = g.get('season', {}).get('league', {}).get('name', 'Unknown')
@@ -405,29 +405,36 @@ with tab1:
                         for p in prices:
                             c = evaluate_line(p['side'], p['line'], home_xg, away_xg, p['odds'], model_trust, stress_pct)
                             c['score'] = score_candidate(c)
-                            cands.append(c)
-                        # เลือกเส้นที่ให้มูลค่าสูงสุดของคู่นี้ (หนึ่งคู่ = หนึ่งคำแนะนำ กันการแทงซ้ำสัมพันธ์กัน)
-                        best = max(cands, key=lambda c: c['ev'])
-                        others = sorted(cands, key=lambda c: c['ev'], reverse=True)[1:3]
-                        alt_text = " · ".join([f"{'O' if c['side'] == 'over' else 'U'}{c['line']:g} @{c['odds']:.2f} ({c['ev'] * 100:+.1f}%)" for c in others])
+                            # ด่านตรวจความสมเหตุสมผลของราคา: EV เกิน +25% หรือราคาสูงเกิน 2 เท่าของ fair ตามโมเดล
+                            # = ข้อมูลราคาเน่า/ผิดรูปแบบจากบางเจ้ามือ ไม่ใช่มูลค่าจริง (ตลาดจริงไม่มี EV ระดับนั้นรอดอยู่ได้)
+                            if c['ev'] <= 0.25 and c['odds'] <= (100.0 / c['p_cons']) * 2.0:
+                                cands.append(c)
+                        if cands:
+                            # เลือกเส้นที่ให้มูลค่าสูงสุดของคู่นี้ (หนึ่งคู่ = หนึ่งคำแนะนำ กันการแทงซ้ำสัมพันธ์กัน)
+                            best = max(cands, key=lambda c: c['ev'])
+                            others = sorted(cands, key=lambda c: c['ev'], reverse=True)[1:3]
+                            alt_text = " · ".join([f"{'O' if c['side'] == 'over' else 'U'}{c['line']:g} @{c['odds']:.2f} ({c['ev'] * 100:+.1f}%)" for c in others])
 
-                        qualified = (best['ev'] * 100 >= min_ev) and best['stress_ok'] and (best['score'] >= score_min)
-                        match_data = {'🎯 คำแนะนำ': f"{'Over' if best['side'] == 'over' else 'Under'} {best['line']:g}",
-                                      '⏰ เวลา': format_match_time(raw_date), '🏆 ลีก': league_display,
-                                      'ทีมเหย้า': home, 'ทีมเยือน': away, 'xG รวม': combined_xg,
-                                      'Poisson (%)': round(best['p_raw'], 1),
-                                      'P ปลอดภัย (%)': round(best['p_cons'], 1),
-                                      '✏️ Odds': best['odds'], 'เจ้ามือ': best.get('bookmaker', '—'),
-                                      'EV (%)': round(best['ev'] * 100, 1), 'คะแนน': best['score'],
-                                      'เกรด': grade_of(best['score']),
-                                      'เส้นอื่นที่ใกล้เคียง': alt_text if alt_text else '—',
-                                      'bet_type': best['side'], 'line': best['line'],
-                                      'game_id': game_id, 'stake_amount': 0}
+                            qualified = (best['ev'] * 100 >= min_ev) and best['stress_ok'] and (best['score'] >= score_min)
+                            match_data = {'🎯 คำแนะนำ': f"{'Over' if best['side'] == 'over' else 'Under'} {best['line']:g}",
+                                          '⏰ เวลา': format_match_time(raw_date), '🏆 ลีก': league_display,
+                                          'ทีมเหย้า': home, 'ทีมเยือน': away, 'xG รวม': combined_xg,
+                                          'Poisson (%)': round(best['p_raw'], 1),
+                                          'P ปลอดภัย (%)': round(best['p_cons'], 1),
+                                          '✏️ Odds': best['odds'], 'เจ้ามือ': best.get('bookmaker', '—'),
+                                          'EV (%)': round(best['ev'] * 100, 1), 'คะแนน': best['score'],
+                                          'เกรด': grade_of(best['score']),
+                                          'เส้นอื่นที่ใกล้เคียง': alt_text if alt_text else '—',
+                                          'bet_type': best['side'], 'line': best['line'],
+                                          'game_id': game_id, 'stake_amount': 0}
 
-                        if qualified:
-                            temp_approved.append(match_data)
-                        elif best['score'] >= score_min - 10:
-                            temp_near.append(match_data)
+                            if qualified:
+                                temp_approved.append(match_data)
+                            elif best['score'] >= score_min - 10:
+                                temp_near.append(match_data)
+                        else:
+                            # มีราคาในฟีดแต่ทุกเส้นทุกเจ้ามือไม่ผ่านการตรวจราคา — ข้ามคู่นี้
+                            games_bad_prices += 1
                     elif abs(combined_xg - 2.7) >= 0.6:
                         # ไม่มีราคาตลาดจริง — บันทึกเป็น watchlist พร้อมเส้น/ราคาที่ควรตาม ไม่ยัดเป็นคำแนะนำ
                         temp_watch.append({'⏰ เวลา': format_match_time(raw_date), '🏆 ลีก': league_display,
@@ -437,7 +444,7 @@ with tab1:
                 except: time.sleep(1); continue
 
             progress_bar.empty(); progress_text.empty()
-            st.info(f"📊 สรุป: {len(games)} คู่ · มีราคาตลาดจริงในฟีด {games_with_prices} คู่ · ผ่านเกณฑ์ {len(temp_approved)} · ใกล้เคียง {len(temp_near)} · รอราคา {len(temp_watch)}")
+            st.info(f"📊 สรุป: {len(games)} คู่ · มีราคาตลาดจริงในฟีด {games_with_prices} คู่ · ผ่านเกณฑ์ {len(temp_approved)} · ใกล้เคียง {len(temp_near)} · รอราคา {len(temp_watch)} · ราคาผิดปกติถูกตัด {games_bad_prices} คู่")
 
         # ✅ เก็บข้อมูลเข้า Memory แทนที่จะแสดงตรงนี้
         st.session_state.scan_results = temp_approved
