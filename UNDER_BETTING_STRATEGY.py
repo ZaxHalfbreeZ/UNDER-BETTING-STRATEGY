@@ -1,19 +1,23 @@
 """
-⚽ UNDER / OVER BOT v4.0 — Smart xG + Poisson Scanner
+⚽ UNDER / OVER BOT v4.1 — Multi-Line Value Scanner
 รันด้วย: streamlit run under_over_bot_v4.py
 ต้องมีไฟล์ .streamlit/secrets.toml ที่มี API_KEY = "..." (เหมือน v3)
 Dependencies: streamlit, requests, pandas, scipy, xlsxwriter
+
+v4.1: ไม่ตรึงเส้น 2.5 — สแกนทุกเส้น Under/Over ที่ตลาดเปิดราคา (1.5, 2.5, 3.5, ...)
+แล้วเลือกเส้นที่ให้ EV สูงสุดของแต่ละคู่ คัดเฉพาะคู่ที่มีราคาตลาดจริงยืนยัน
 """
 import streamlit as st
 import requests
 import pandas as pd
 import time
 import io
+import re
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from scipy.stats import poisson
 
-st.set_page_config(page_title="Under/Over Bot v4.0", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="Under/Over Bot v4.1 Multi-Line", page_icon="⚽", layout="wide")
 
 # ==========================================
 # 🎨 ธีมหน้าเว็บ (Modern UI)
@@ -33,6 +37,7 @@ html, body, [class*="css"], .stApp { font-family: 'Kanit', 'Segoe UI', sans-seri
                font-size: 1.05rem; margin: .6rem 0 .1rem 0; }
 .side-header.under { background: linear-gradient(90deg, #1e3c72, #2a5298); }
 .side-header.over  { background: linear-gradient(90deg, #ad5300, #e67700); }
+.side-header.both  { background: linear-gradient(90deg, #0f2027, #2c5364); }
 [data-testid="stMetric"] { background: rgba(130,130,150,.08); border: 1px solid rgba(130,130,150,.22);
                            border-radius: 14px; padding: 14px 16px; }
 footer { visibility: hidden; }
@@ -51,7 +56,7 @@ def init_db():
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   scan_date TEXT, game_id TEXT, home TEXT, away TEXT,
                   league TEXT, xg REAL, poisson REAL, score REAL, odds REAL, stake REAL,
-                  bet_type TEXT DEFAULT 'under',
+                  bet_type TEXT DEFAULT 'under', line REAL DEFAULT 2.5,
                   ev REAL DEFAULT 0, prob_cons REAL DEFAULT 0,
                   status TEXT DEFAULT 'pending', profit REAL DEFAULT 0)''')
     conn.commit()
@@ -61,10 +66,11 @@ def migrate_db():
     # ไฟล์ .db จาก v3 ยังไม่มีคอลัมน์ bet_type — CREATE TABLE IF NOT EXISTS ไม่เติมให้ ต้อง ALTER เอง
     conn = sqlite3.connect('betting_log.db')
     c = conn.cursor()
-    # คอลัมน์ที่เพิ่มใน v4: bet_type (under/over), ev, prob_cons (ความน่าจะเป็นแบบปรับความเสี่ยงแล้ว)
+    # คอลัมน์ที่เพิ่มใน v4: bet_type (under/over), line (เส้นที่แทง), ev, prob_cons (ความน่าจะเป็นแบบปรับความเสี่ยงแล้ว)
     for stmt in ("ALTER TABLE pending_bets ADD COLUMN bet_type TEXT DEFAULT 'under'",
                  "ALTER TABLE pending_bets ADD COLUMN ev REAL DEFAULT 0",
-                 "ALTER TABLE pending_bets ADD COLUMN prob_cons REAL DEFAULT 0"):
+                 "ALTER TABLE pending_bets ADD COLUMN prob_cons REAL DEFAULT 0",
+                 "ALTER TABLE pending_bets ADD COLUMN line REAL DEFAULT 2.5"):
         try:
             c.execute(stmt)
             conn.commit()
@@ -78,11 +84,11 @@ def save_bets_to_db(bets, scan_date):
     c = conn.cursor()
     for b in bets:
         c.execute('''INSERT INTO pending_bets
-                     (scan_date, game_id, home, away, league, xg, poisson, score, odds, stake, bet_type, ev, prob_cons)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                     (scan_date, game_id, home, away, league, xg, poisson, score, odds, stake, bet_type, line, ev, prob_cons)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (scan_date, b['game_id'], b['ทีมเหย้า'], b['ทีมเยือน'], b['🏆 ลีก'],
-                   b['xG รวม'], b['Poisson (%)'], b['คะแนน'], b['✏️ Odds 2.5'], b['stake_amount'], b['bet_type'],
-                   b['EV (%)'], b['P ปลอดภัย (%)']))
+                   b['xG รวม'], b['Poisson (%)'], b['คะแนน'], b['✏️ Odds'], b['stake_amount'], b['bet_type'],
+                   b['line'], b['EV (%)'], b['P ปลอดภัย (%)']))
     conn.commit()
     conn.close()
 
@@ -114,76 +120,96 @@ HEADERS = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
 def _clamp01(x):
     return max(0.0, min(1.0, x))
 
-def under_probability(lambda_home, lambda_away, stress=0.0):
-    # ผลรวมของ Poisson สองตัว = Poisson(ผลรวม xG): เส้น 2.5 คือ P(ยิงรวมกันไม่เกิน 2 ประตู)
+def under_probability(lambda_home, lambda_away, goals=2, stress=0.0):
+    # ผลรวมของ Poisson สองตัว = Poisson(ผลรวม xG): เส้น L คือ P(ยิงรวมกันไม่เกิน floor(L) ประตู)
     total = (lambda_home + lambda_away) * (1.0 + stress)
-    return float(poisson.cdf(2, total) * 100)
+    return float(poisson.cdf(goals, total) * 100)
 
-def evaluate_match(side, lambda_home, lambda_away, odds, xg_target, model_trust, stress_pct):
+def evaluate_line(side, line, lambda_home, lambda_away, odds, model_trust, stress_pct):
     """
-    ให้คะแนนแบบอนุรักษ์นิยมเพื่อความแน่นอน (คืน dict):
-      p_raw    : ความน่าจะเป็นดิบจาก Poisson
+    ประเมินเส้นเดียวของคู่หนึ่ง (side = 'under'/'over', line = เส้นครึ่ง เช่น 3.5):
+      p_raw    : ความน่าจะเป็นดิบจาก Poisson ที่เส้นนั้น
       p_cons   : ค่าที่ใช้ตัดสินจริง — บีบเข้าหา 50% ตาม model_trust (กันโมเดลพลาด)
-      ev       : Expected Value เทียบราคาที่แทงจริง (ถ้าตลาดยังไม่เปิดราคา ใช้ benchmark 1.90)
-      score    : 0-100 = EV 45% + ส่วนต่างความน่าจะเป็นเหนือเส้นคุ้มทุน 35% + ส่วนต่าง xG 20%
-      qualified: ต้องผ่านครบทุกด่าน (prob/ev/xg/stress) ไม่ใช่แค่คะแนนรวมถึงเกณฑ์
+      stress_ok: แม้ xG คลาดเคลื่อนทางร้ายตาม stress_pct ก็ยังชนะเส้นคุ้มทุนของราคานี้
+      ev       : Expected Value = p_cons × ราคาจริง − 1
     """
     stress = stress_pct / 100.0
+    goal_limit = int(line)  # เส้นครึ่ง เช่น 3.5 → under คือยิงรวม ≤ 3, over คือยิงรวม ≥ 4
     if side == 'under':
-        p_raw = under_probability(lambda_home, lambda_away)
-        p_stress = under_probability(lambda_home, lambda_away, stress=+stress)          # ถ้าบอลไหลมากกว่า xG
+        p_raw = under_probability(lambda_home, lambda_away, goals=goal_limit)
+        p_stress = under_probability(lambda_home, lambda_away, goals=goal_limit, stress=+stress)
     else:
-        p_raw = 100.0 - under_probability(lambda_home, lambda_away)
-        p_stress = 100.0 - under_probability(lambda_home, lambda_away, stress=-stress)  # ถ้าบอลน้อยกว่า xG
+        p_raw = 100.0 - under_probability(lambda_home, lambda_away, goals=goal_limit)
+        p_stress = 100.0 - under_probability(lambda_home, lambda_away, goals=goal_limit, stress=-stress)
 
     p_cons = 50.0 + (p_raw - 50.0) * model_trust
     p_cons_stress = 50.0 + (p_stress - 50.0) * model_trust
+    ev = (p_cons / 100.0) * odds - 1.0
+    return {'side': side, 'line': line, 'odds': odds,
+            'p_raw': p_raw, 'p_cons': p_cons, 'stress_ok': p_cons_stress >= 100.0 / odds, 'ev': ev}
 
-    has_real_odds = odds >= 1.50
-    book_odds = odds if has_real_odds else 1.90
-    p_be = 100.0 / book_odds                    # เส้นคุ้มทุนของราคาที่แทงจริง
-    ev = (p_cons / 100.0) * book_odds - 1.0     # มูลค่าที่คาดหวังต่อเงิน 1 หน่วย
+def score_candidate(c):
+    # คะแนน 0-100 ต่อเส้น: EV 60% + ส่วนต่างความน่าจะเป็นเหนือเส้นคุ้มทุน 40% (ต่อเนื่อง ไม่มีหน้าผา)
+    p_be = 100.0 / c['odds']
+    s_edge = _clamp01(c['ev'] / 0.08) * 100               # EV +8% ขึ้นไป = เต็ม
+    s_prob = _clamp01((c['p_cons'] - p_be) / 10.0) * 100  # ชนะเส้นคุ้มทุน 10 จุด = เต็ม
+    return round(s_edge * 0.6 + s_prob * 0.4, 1)
 
-    combined_xg = lambda_home + lambda_away
-    if xg_target > 0:
-        xg_margin = (xg_target - combined_xg) / xg_target if side == 'under' else (combined_xg - xg_target) / xg_target
-    else:
-        xg_margin = 0.0
+def grade_of(score):
+    return 'A' if score >= 70 else ('B' if score >= 55 else 'C')
 
-    s_edge = _clamp01(ev / 0.10) * 100                 # EV +10% ขึ้นไป = เต็ม
-    s_prob = _clamp01((p_cons - p_be) / 12.0) * 100    # ชนะเส้นคุ้มทุน 12 จุด = เต็ม
-    s_xg = _clamp01(xg_margin / 0.25) * 100            # ห่างจากเป้า xG 25% = เต็ม
-    score = round(s_edge * 0.45 + s_prob * 0.35 + s_xg * 0.20, 1)
-
-    gates = {'prob': p_cons >= p_be,           # หลังหักความเชื่อมั่นแล้วยังชนะราคา
-             'ev': ev > 0,                     # มีมูลค่าเชิงราคา
-             'xg': xg_margin > 0,              # xG อยู่ฝั่งเดียวกับที่แทง (confluence กับ Poisson)
-             'stress': p_cons_stress >= p_be}  # แม้ xG เพี้ยนทางร้ายตาม stress_pct ก็ยังคุ้มทุน
-    grade = 'A' if score >= 75 else ('B' if score >= 65 else 'C')
-    return {'p_raw': p_raw, 'p_cons': p_cons, 'ev': ev, 'score': score, 'grade': grade,
-            'qualified': all(gates.values()), 'has_real_odds': has_real_odds}
-
-def _extract_side_odds(game_data, side):
+def parse_market_prices(game_data):
+    """
+    ดึงราคา Under/Over จากทุกเส้นในฟีดราคา (ไม่ตรึงเส้น 2.5) — คืน list ของ {line, side, odds}
+    รับเฉพาะเส้นครึ่ง (x.5) เพราะไม่มีผลเสมอ และข้ามมาร์เก็ตมุม/ใบเหลือง/ครึ่งเวลา
+    """
+    best_price = {}
     try:
         for market in game_data.get('odds', []):
             market_name = market.get('marketName', '').lower()
-            if '2.5' in market_name or 'under/over' in market_name:
-                for odd in market.get('odds', []):
-                    name = odd.get('name', '').lower()
-                    # ฝั่ง over ต้องใช้ startswith เพราะชื่อมาร์เก็ต "Under/Over" มีคำว่า over ซ่อนอยู่
-                    hit = name.startswith('over') if side == 'over' else 'under' in name
-                    if hit:
-                        try: val = float(odd.get('value') or 0)
-                        except (TypeError, ValueError): val = 0.0
-                        if val >= 1.50: return val
-        return 0.0
-    except: return 0.0
+            if not ('under' in market_name or 'over' in market_name):
+                continue
+            if any(word in market_name for word in ['corner', 'card', 'half', 'shot', 'booking', 'race']):
+                continue
+            m = re.search(r'(\d+(?:\.\d+)?)', market_name)
+            market_line = float(m.group(1)) if m else None
+            for odd in market.get('odds', []):
+                name = odd.get('name', '').lower()
+                side = 'over' if name.startswith('over') else ('under' if name.startswith('under') else None)
+                if side is None:
+                    continue
+                line = market_line
+                if line is None:
+                    # เส้นอาจระบุอยู่ในชื่อโพยแทน เช่น "Over 3.5"
+                    m2 = re.search(r'(\d+(?:\.\d+)?)', name)
+                    if not m2:
+                        continue
+                    line = float(m2.group(1))
+                if line % 1 != 0.5 or line < 0.5:
+                    continue
+                try: val = float(odd.get('value') or 0)
+                except (TypeError, ValueError): val = 0.0
+                if val < 1.01:
+                    continue
+                key = (line, side)
+                if key not in best_price or val > best_price[key]['odds']:
+                    best_price[key] = {'line': line, 'side': side, 'odds': val}
+    except Exception:
+        pass
+    return list(best_price.values())
 
-def get_under_25_odds(game_data):
-    return _extract_side_odds(game_data, 'under')
-
-def get_over_25_odds(game_data):
-    return _extract_side_odds(game_data, 'over')
+def fair_line_suggestion(lambda_home, lambda_away, model_trust, stress_pct):
+    """
+    สำหรับคู่ที่ตลาดยังไม่เปิดราคา: แนะนำเส้นรอบๆ ผลรวม xG พร้อมราคาขั้นต่ำที่ควรรับ
+    (คำนวณจากความน่าจะเป็นแบบปรับความเสี่ยงแล้ว เพื่อให้ราคาที่รอมี margin ความปลอดภัย)
+    """
+    lam = lambda_home + lambda_away
+    stress = stress_pct / 100.0
+    line_over = max(0.5, int(lam) - 0.5)   # เส้นต่ำกว่าค่าคาดหวัง → ฝั่ง Over คือธรรมชาติของเกมนี้
+    line_under = int(lam) + 0.5            # เส้นสูงกว่าค่าคาดหวัง → ฝั่ง Under
+    p_over = 50.0 + ((100.0 - under_probability(lambda_home, lambda_away, goals=int(line_over), stress=-stress)) - 50.0) * model_trust
+    p_under = 50.0 + (under_probability(lambda_home, lambda_away, goals=int(line_under), stress=+stress) - 50.0) * model_trust
+    return f"Over {line_over:g} ควรรับ ≥ {100.0 / p_over:.2f} · Under {line_under:g} ควรรับ ≥ {100.0 / p_under:.2f}"
 
 def calculate_kelly_stake(odds, probability, bankroll):
     if not odds or odds <= 1.0 or not bankroll: return 0.0, 0.0
@@ -201,42 +227,37 @@ def format_match_time(date_str):
         return dt.astimezone(thai_tz).strftime("%H:%M")
     except: return "N/A"
 
-def create_excel_with_formula(sides, current_bankroll):
-    # sides = list ของ (bet_type, edited_df) → หนึ่ง sheet ต่อฝั่ง
+def create_excel_with_formula(df_edited, current_bankroll):
     output = io.BytesIO()
     try: import xlsxwriter
     except ImportError: return None
-    wrote_any = False
+    excel_data = []
+    for _, row in df_edited.iterrows():
+        if row['✏️ Odds'] >= 1.01:
+            excel_data.append({'คู่บอล': f"{row['ทีมเหย้า']} vs {row['ทีมเยือน']}",
+                               'คำแนะนำ': row['🎯 คำแนะนำ'],
+                               'ใส่ Odds ตรงนี้': row['✏️ Odds'],
+                               'P ปลอดภัย (%)': row['P ปลอดภัย (%)']})
+    if not excel_data: return None
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        for bet_type, df_side in sides:
-            excel_data = []
-            for _, row in df_side.iterrows():
-                if row['✏️ Odds 2.5'] >= 1.50:
-                    excel_data.append({'คู่บอล': f"{row['ทีมเหย้า']} vs {row['ทีมเยือน']}",
-                                       'ใส่ Odds ตรงนี้': row['✏️ Odds 2.5'],
-                                       'P ปลอดภัย (%)': row['P ปลอดภัย (%)']})
-            if not excel_data: continue
-            sheet_name = 'Under 2.5' if bet_type == 'under' else 'Over 2.5'
-            pd.DataFrame(excel_data).to_excel(writer, index=False, sheet_name=sheet_name, startrow=1, header=False)
-            workbook = writer.book; worksheet = writer.sheets[sheet_name]
-            header_format = workbook.add_format({'bold': True, 'align': 'center', 'bg_color': '#4F81BD', 'font_color': 'white', 'border': 1})
-            for col_num, header in enumerate(['คู่บอล', 'ใส่ Odds ตรงนี้', 'P ปลอดภัย (%)', '💰 เงินแทงอัตโนมัติ (บาท)']):
-                worksheet.write(0, col_num, header, header_format)
-            worksheet.set_column('A:A', 35); worksheet.set_column('B:B', 25); worksheet.set_column('C:C', 20); worksheet.set_column('D:D', 30)
-            money_format = workbook.add_format({'num_format': '#,##0" ฿"', 'align': 'center'})
-            for row_num in range(1, len(excel_data) + 1):
-                formula = f'=IF(B{row_num}>=1.5, MIN(MAX((((B{row_num}-1)*(C{row_num}/100)-(1-(C{row_num}/100)))/(B{row_num}-1))*30, 0), 5) * {current_bankroll} / 100, 0)'
-                worksheet.write_formula(row_num, 3, formula)
-                worksheet.set_format(row_num, 3, money_format)
-            wrote_any = True
-    if not wrote_any: return None
+        pd.DataFrame(excel_data).to_excel(writer, index=False, sheet_name='Bet Plan', startrow=1, header=False)
+        workbook = writer.book; worksheet = writer.sheets['Bet Plan']
+        header_format = workbook.add_format({'bold': True, 'align': 'center', 'bg_color': '#4F81BD', 'font_color': 'white', 'border': 1})
+        for col_num, header in enumerate(['คู่บอล', 'คำแนะนำ', 'ใส่ Odds ตรงนี้', 'P ปลอดภัย (%)', '💰 เงินแทงอัตโนมัติ (บาท)']):
+            worksheet.write(0, col_num, header, header_format)
+        worksheet.set_column('A:A', 35); worksheet.set_column('B:B', 12); worksheet.set_column('C:C', 15); worksheet.set_column('D:D', 15); worksheet.set_column('E:E', 30)
+        money_format = workbook.add_format({'num_format': '#,##0" ฿"', 'align': 'center'})
+        for row_num in range(1, len(excel_data) + 1):
+            formula = f'=IF(C{row_num}>=1.01, MIN(MAX((((C{row_num}-1)*(D{row_num}/100)-(1-(D{row_num}/100)))/(C{row_num}-1))*30, 0), 5) * {current_bankroll} / 100, 0)'
+            worksheet.write_formula(row_num, 4, formula)
+            worksheet.set_format(row_num, 4, money_format)
     output.seek(0)
     return output
 
 # ==========================================
 # ✅ เตรียมหน่วยความจำ (Session State) ให้พร้อม
 # ==========================================
-for key in ['scan_results_under', 'scan_results_over', 'near_misses_under', 'near_misses_over']:
+for key in ['scan_results', 'near_misses', 'watchlist']:
     if key not in st.session_state:
         st.session_state[key] = []
 
@@ -245,8 +266,8 @@ for key in ['scan_results_under', 'scan_results_over', 'near_misses_under', 'nea
 # ==========================================
 st.markdown("""
 <div class="hero">
-    <div class="hero-title">⚽ UNDER / OVER BOT<span class="ver">v4.0</span></div>
-    <div class="hero-sub">Smart xG + Poisson Scanner — สแกนคู่บอลได้ทั้งฝั่ง Under และ Over 2.5 ในการสแกนเดียว</div>
+    <div class="hero-title">⚽ UNDER / OVER BOT<span class="ver">v4.1 Multi-Line</span></div>
+    <div class="hero-sub">สแกนทุกเส้น Under/Over ที่ตลาดเปิดราคา แล้วเลือกเส้นที่คุ้มที่สุดของแต่ละคู่ — คัดเฉพาะคู่ที่มีราคาตลาดจริงยืนยัน</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -262,28 +283,25 @@ with tab1:
     sides_to_scan = ['under'] if scan_mode == 'under' else ['over'] if scan_mode == 'over' else ['under', 'over']
 
     with st.expander("⚙️ ตั้งค่าเกณฑ์การคัดกรอง", expanded=False):
-        st.markdown("🛡️ **ระดับความเข้มงวดของโมเดล** (ใช้ร่วมกันทุกฝั่ง — ยิ่งเข้มงวด คู่ยิ่งน้อยแต่แน่นอนขึ้น)")
+        st.markdown("🛡️ **ระดับความเข้มงวดของโมเดล** (ยิ่งเข้มงวด คู่ยิ่งน้อยแต่แน่นอนขึ้น)")
         sc1, sc2 = st.columns(2)
         with sc1:
             model_trust = st.slider("ความเชื่อมั่นในโมเดล Poisson", min_value=0.50, max_value=1.00, value=0.85, step=0.05,
                                     help="1.00 = เชื่อค่าที่โมเดลคำนวณเต็มร้อย | ยิ่งต่ำ = บีบความน่าจะเป็นเข้าหา 50% มากขึ้น เพื่อกันกรณีโมเดลประเมินเกิน")
         with sc2:
             stress_pct = st.slider("Stress Test: สมมติ xG คลาดเคลื่อน (%)", min_value=0, max_value=20, value=10, step=5,
-                                   help="ตรวจว่าถ้า xG คลาดเคลื่อนไปทางร้ายตาม % นี้ (ฝั่งที่เสียเปรียบการแทงของเรา) คู่นั้นจะยังคุ้มทุนอยู่ไหม — ไม่ผ่านด่านนี้จะไม่ถูกคัดเลย")
-        score_targets = {}; xg_targets = {}
-        col1, col2 = st.columns(2)
-        if 'under' in sides_to_scan:
-            with col1:
-                st.markdown("🔽 **ฝั่ง Under 2.5**")
-                score_targets['under'] = st.slider("🎯 คะแนนผ่านเกณฑ์ขั้นต่ำ (Under)", min_value=40, max_value=95, value=60, step=5,
-                                                   help="คะแนนเชิงมูลค่า: EV เทียบราคาจริง 45% + ความน่าจะเป็นเหนือเส้นคุ้มทุน 35% + ส่วนต่าง xG 20%")
-                xg_targets['under'] = st.slider("📊 xG รวมสูงสุดที่ยอมรับ (Under)", min_value=2.0, max_value=3.5, value=2.6, step=0.1)
-        if 'over' in sides_to_scan:
-            with col2:
-                st.markdown("🔼 **ฝั่ง Over 2.5**")
-                score_targets['over'] = st.slider("🎯 คะแนนผ่านเกณฑ์ขั้นต่ำ (Over)", min_value=40, max_value=95, value=60, step=5,
-                                                  help="คะแนนเชิงมูลค่า: EV เทียบราคาจริง 45% + ความน่าจะเป็นเหนือเส้นคุ้มทุน 35% + ส่วนต่าง xG 20%")
-                xg_targets['over'] = st.slider("📊 xG รวมขั้นต่ำที่ยอมรับ (Over)", min_value=2.6, max_value=4.0, value=3.2, step=0.1)
+                                   help="ตรวจว่าถ้า xG คลาดเคลื่อนไปทางร้ายตาม % นี้ (ฝั่งที่เสียเปรียบการแทงของเรา) เส้นนั้นจะยังคุ้มทุนอยู่ไหม — ไม่ผ่านด่านนี้จะไม่ถูกคัดเลย")
+        st.markdown("🎚️ **เกณฑ์การคัดคู่** (ใช้กับทุกเส้น)")
+        gc1, gc2, gc3 = st.columns(3)
+        with gc1:
+            min_odds = st.slider("ราคาต่ำสุดที่ยอมรับ", min_value=1.10, max_value=2.00, value=1.30, step=0.05,
+                                 help="กันราคาจ่ายต่ำเกินไป — ราคายิ่งต่ำ เส้นคุ้มทุนยิ่งสูง (ราคา 1.30 ต้องชนะ 76.9% ถึงจะคุ้ม) โมเดลพลาดแม้เล็กน้อยก็ขาดทุน")
+        with gc2:
+            min_ev = st.slider("EV ขั้นต่ำ (%)", min_value=0, max_value=15, value=2, step=1,
+                               help="มูลค่าพรีเมียมเหนือเส้นคุ้มทุนที่ต้องการ — ราคาตลาดต้องดีกว่าที่โมเดลคิดอย่างน้อยเท่านี้จึงจะแนะนำ")
+        with gc3:
+            score_min = st.slider("คะแนนขั้นต่ำ", min_value=20, max_value=90, value=50, step=5,
+                                  help="คะแนน = EV เทียบราคาจริง 60% + ส่วนต่างความน่าจะเป็นเหนือเส้นคุ้มทุน 40% (คำนวณต่อเส้นที่เลือก)")
         bankroll = st.number_input("💰 เงินทุนทั้งหมด (บาท)", min_value=100, value=5000, step=100)
 
     # ❌ ขั้นตอนที่ 1: ถ้ากดปุ่ม ให้ "ทำงานหนัก" แล้วเก็บผลลัพธ์เข้า Session State
@@ -298,7 +316,7 @@ with tab1:
                 games = [g for g in res_list.get('data', []) if g.get('statusName', '').lower() not in ['finished', 'cancelled', 'postponed']]
             except: games = []
 
-        temp_approved = {'under': [], 'over': []}; temp_near = {'under': [], 'over': []}
+        temp_approved = []; temp_near = []; temp_watch = []
 
         if not games:
             st.warning("ไม่พบแมตช์ที่กำลังจะแข่งในวันนี้")
@@ -321,92 +339,106 @@ with tab1:
                     home_xg = float(home_xg); away_xg = float(away_xg); combined_xg = home_xg + away_xg
                     league_display = f"{country} - {league}" if country else league
 
-                    for bet_type in sides_to_scan:
-                        odds = get_under_25_odds(g) if bet_type == 'under' else get_over_25_odds(g)
-                        eva = evaluate_match(bet_type, home_xg, away_xg, odds,
-                                             xg_targets.get(bet_type, 2.6 if bet_type == 'under' else 3.2),
-                                             model_trust, stress_pct)
+                    # ราคาจริงทุกเส้นจากฟีด — กรองตามโหมดและราคาต่ำสุดที่ยอมรับ
+                    prices = [p for p in parse_market_prices(g)
+                              if p['odds'] >= min_odds and p['side'] in sides_to_scan]
+                    if prices:
+                        cands = []
+                        for p in prices:
+                            c = evaluate_line(p['side'], p['line'], home_xg, away_xg, p['odds'], model_trust, stress_pct)
+                            c['score'] = score_candidate(c)
+                            cands.append(c)
+                        # เลือกเส้นที่ให้มูลค่าสูงสุดของคู่นี้ (หนึ่งคู่ = หนึ่งคำแนะนำ กันการแทงซ้ำสัมพันธ์กัน)
+                        best = max(cands, key=lambda c: c['ev'])
+                        others = sorted(cands, key=lambda c: c['ev'], reverse=True)[1:3]
+                        alt_text = " · ".join([f"{'O' if c['side'] == 'over' else 'U'}{c['line']:g} @{c['odds']:.2f} ({c['ev'] * 100:+.1f}%)" for c in others])
 
-                        match_data = {'🎯 ประเภท': SIDE_LABEL[bet_type], '⏰ เวลา': format_match_time(raw_date),
-                                      '🏆 ลีก': league_display, 'ทีมเหย้า': home, 'ทีมเยือน': away,
-                                      'xG รวม': combined_xg,
-                                      'Poisson (%)': round(eva['p_raw'], 1),
-                                      'P ปลอดภัย (%)': round(eva['p_cons'], 1),
-                                      'EV (%)': round(eva['ev'] * 100, 1), 'คะแนน': eva['score'],
-                                      'เกรด': (eva['grade'] + '⚠️') if eva['qualified'] else '—',
-                                      '✏️ Odds 2.5': odds, 'game_id': game_id, 'stake_amount': 0}
+                        qualified = (best['ev'] * 100 >= min_ev) and best['stress_ok'] and (best['score'] >= score_min)
+                        match_data = {'🎯 คำแนะนำ': f"{'Over' if best['side'] == 'over' else 'Under'} {best['line']:g}",
+                                      '⏰ เวลา': format_match_time(raw_date), '🏆 ลีก': league_display,
+                                      'ทีมเหย้า': home, 'ทีมเยือน': away, 'xG รวม': combined_xg,
+                                      'Poisson (%)': round(best['p_raw'], 1),
+                                      'P ปลอดภัย (%)': round(best['p_cons'], 1),
+                                      '✏️ Odds': best['odds'],
+                                      'EV (%)': round(best['ev'] * 100, 1), 'คะแนน': best['score'],
+                                      'เกรด': grade_of(best['score']),
+                                      'เส้นอื่นที่ใกล้เคียง': alt_text if alt_text else '—',
+                                      'bet_type': best['side'], 'line': best['line'],
+                                      'game_id': game_id, 'stake_amount': 0}
 
-                        if eva['qualified'] and eva['score'] >= score_targets.get(bet_type, 60):
-                            temp_approved[bet_type].append(match_data)
-                        elif eva['score'] >= score_targets.get(bet_type, 60) - 10:
-                            temp_near[bet_type].append(match_data)
+                        if qualified:
+                            temp_approved.append(match_data)
+                        elif best['score'] >= score_min - 10:
+                            temp_near.append(match_data)
+                    elif abs(combined_xg - 2.7) >= 0.6:
+                        # ไม่มีราคาตลาดจริง — บันทึกเป็น watchlist พร้อมเส้น/ราคาที่ควรตาม ไม่ยัดเป็นคำแนะนำ
+                        temp_watch.append({'⏰ เวลา': format_match_time(raw_date), '🏆 ลีก': league_display,
+                                           'คู่บอล': f"{home} vs {away}", 'xG รวม': combined_xg,
+                                           '💡 รอราคาที่ควรรับ': fair_line_suggestion(home_xg, away_xg, model_trust, stress_pct)})
                     time.sleep(0.5)
                 except: time.sleep(1); continue
 
             progress_bar.empty(); progress_text.empty()
 
         # ✅ เก็บข้อมูลเข้า Memory แทนที่จะแสดงตรงนี้
-        st.session_state.scan_results_under = temp_approved['under']
-        st.session_state.scan_results_over = temp_approved['over']
-        st.session_state.near_misses_under = temp_near['under']
-        st.session_state.near_misses_over = temp_near['over']
+        st.session_state.scan_results = temp_approved
+        st.session_state.near_misses = temp_near
+        st.session_state.watchlist = temp_watch
 
     # ✅ ขั้นตอนที่ 2: แสดงผลตาราง "ข้างนอก" ปุ่มกด (จะไม่หายแม้คุณจะพิมพ์แก้ไข)
-    final_bets_all = []
-    excel_sides = []
-    for bet_type in ['under', 'over']:
-        if not st.session_state[f'scan_results_{bet_type}']: continue
+    if st.session_state.scan_results:
+        st.markdown(f'<div class="side-header both">🎯 คู่ที่ผ่านเกณฑ์ — พบ {len(st.session_state.scan_results)} คู่ (เลือกเส้นที่ EV ดีที่สุดของแต่ละคู่แล้ว)</div>', unsafe_allow_html=True)
+        st.caption("แก้ราคาในคอลัมน์ ✏️ Odds ได้เลย — EV และเงินแทงจะคำนวณใหม่ทันที คู่ที่ EV กลายเป็นลบจะถูกตัดออกเอง")
 
-        st.markdown(f'<div class="side-header {bet_type}">{SIDE_LABEL[bet_type]} — พบ {len(st.session_state[f"scan_results_{bet_type}"])} คู่ผ่านเกณฑ์ ✅</div>', unsafe_allow_html=True)
-        st.caption("แก้ราคาในคอลัมน์ ✏️ Odds 2.5 ได้เลย — EV และเงินแทงจะคำนวณใหม่ทันที · เกรดต่อท้าย ⚠️ = คำนวณจากราคา benchmark 1.90 เพราะตลาดยังไม่เปิดราคาตอนสแกน")
-
-        df = pd.DataFrame(st.session_state[f'scan_results_{bet_type}'])
+        df = pd.DataFrame(st.session_state.scan_results)
         df = df.sort_values(by='คะแนน', ascending=False).reset_index(drop=True)
 
-        edited_df = st.data_editor(df, disabled=["🎯 ประเภท", "⏰ เวลา", "🏆 ลีก", "ทีมเหย้า", "ทีมเยือน", "xG รวม", "Poisson (%)", "P ปลอดภัย (%)", "EV (%)", "คะแนน", "เกรด", "game_id", "stake_amount"],
+        edited_df = st.data_editor(df, disabled=["🎯 คำแนะนำ", "⏰ เวลา", "🏆 ลีก", "ทีมเหย้า", "ทีมเยือน", "xG รวม", "Poisson (%)", "P ปลอดภัย (%)", "EV (%)", "คะแนน", "เกรด", "เส้นอื่นที่ใกล้เคียง", "bet_type", "line", "game_id", "stake_amount"],
                                    width="stretch", height=400, hide_index=True)
 
         # คำนวณเงินแทงจากค่าที่ถูกแก้ไขแล้ว — ใช้ P ปลอดภัยใน Kelly: ถ้า EV ติดลบ Kelly จะเป็นลบและตัดคู่นั้นทิ้งเอง
-        final_bets = []
+        final_bets_all = []
         for _, row in edited_df.iterrows():
-            odds = row['✏️ Odds 2.5']; prob = row['P ปลอดภัย (%)']
-            if odds >= 1.50:
+            odds = row['✏️ Odds']; prob = row['P ปลอดภัย (%)']
+            if odds >= min_odds:
                 stake_pct, bet_amount = calculate_kelly_stake(odds, prob, bankroll)
                 if bet_amount > 0:
                     row = row.copy(); row['stake_amount'] = bet_amount
                     row['EV (%)'] = round(((prob / 100.0) * odds - 1.0) * 100, 1)
-                    final_bets.append({**row.to_dict(), 'bet_type': bet_type})
+                    final_bets_all.append({**row.to_dict()})
 
-        if final_bets:
-            df_bets = pd.DataFrame(final_bets)[['🎯 ประเภท', 'ทีมเหย้า', 'ทีมเยือน', '✏️ Odds 2.5', 'EV (%)', 'stake_amount']].rename(columns={'stake_amount': '💰 แทง (บาท)'})
+        if final_bets_all:
+            df_bets = pd.DataFrame(final_bets_all)[['🎯 คำแนะนำ', 'ทีมเหย้า', 'ทีมเยือน', '✏️ Odds', 'EV (%)', 'stake_amount']].rename(columns={'stake_amount': '💰 แทง (บาท)'})
             df_bets['💰 แทง (บาท)'] = df_bets['💰 แทง (บาท)'].apply(lambda x: f"{x:,.0f} ฿")
             df_bets['EV (%)'] = df_bets['EV (%)'].apply(lambda x: f"{x:+.1f}%")
             st.dataframe(df_bets, width="stretch", hide_index=True)
-            final_bets_all.extend(final_bets)
-            excel_sides.append((bet_type, edited_df))
+
+            st.divider()
+            excel_file = create_excel_with_formula(edited_df, bankroll)
+            if excel_file:
+                st.download_button(label="📥 ดาวน์โหลดไฟล์ Excel", data=excel_file,
+                                   file_name=f'UnderOver_Bet_{datetime.now().strftime("%Y-%m-%d")}.xlsx',
+                                   mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+            if st.button("💾 ยืนยันการบันทึกคู่เหล่านี้เพื่อตรวจสอบผลวันพรุ่งนี้", type="secondary", use_container_width=True):
+                save_bets_to_db(final_bets_all, datetime.now().strftime('%Y-%m-%d'))
+                st.success("✅ บันทึกลงระบบสำเร็จแล้ว! พรุ่งนี้มากด Tab 2 เพื่อดูผลลัพธ์ได้เลย")
+                st.session_state.scan_results = []; st.session_state.near_misses = []; st.session_state.watchlist = []
         else:
-            st.warning(f"ฝั่ง {SIDE_LABEL[bet_type]}: กรุณาใส่เลข Odds ที่มากกว่า 1.50 เพื่อคำนวณเงินแทง")
+            st.warning("ไม่มีคู่ที่มีมูลค่าพอจะแทงตามราคาปัจจุบัน — ลองแก้ราคาในคอลัมน์ ✏️ Odds หรือปรับเกณฑ์การคัดกรอง")
 
-    if final_bets_all:
-        st.divider()
-        excel_file = create_excel_with_formula(excel_sides, bankroll)
-        if excel_file:
-            st.download_button(label="📥 ดาวน์โหลดไฟล์ Excel", data=excel_file,
-                               file_name=f'UnderOver_Bet_{datetime.now().strftime("%Y-%m-%d")}.xlsx',
-                               mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    if st.session_state.near_misses:
+        st.markdown('<div class="side-header both">⚠️ คู่ที่ใกล้เคียงเกณฑ์</div>', unsafe_allow_html=True)
+        df_near = pd.DataFrame(st.session_state.near_misses)
+        df_near = df_near.sort_values(by='คะแนน', ascending=False).head(3).reset_index(drop=True)
+        st.dataframe(df_near, width="stretch", hide_index=True)
 
-        if st.button("💾 ยืนยันการบันทึกคู่เหล่านี้เพื่อตรวจสอบผลวันพรุ่งนี้", type="secondary", use_container_width=True):
-            save_bets_to_db(final_bets_all, datetime.now().strftime('%Y-%m-%d'))
-            st.success("✅ บันทึกลงระบบสำเร็จแล้ว! พรุ่งนี้มากด Tab 2 เพื่อดูผลลัพธ์ได้เลย")
-            st.session_state.scan_results_under = []; st.session_state.scan_results_over = []
-            st.session_state.near_misses_under = []; st.session_state.near_misses_over = []
-
-    for bet_type in ['under', 'over']:
-        if st.session_state[f'near_misses_{bet_type}']:
-            st.markdown(f'<div class="side-header {bet_type}">⚠️ {SIDE_LABEL[bet_type]} — คู่ที่ใกล้เคียงเกณฑ์</div>', unsafe_allow_html=True)
-            df_near = pd.DataFrame(st.session_state[f'near_misses_{bet_type}'])
-            df_near = df_near.sort_values(by='คะแนน', ascending=False).head(3).reset_index(drop=True)
-            st.dataframe(df_near, width="stretch", hide_index=True)
+    if st.session_state.watchlist:
+        with st.expander(f"👀 คู่ที่โมเดลเห็นสถานการณ์ไม่ธรรมดาแต่ยังไม่มีราคาตลาด ({len(st.session_state.watchlist)} คู่)", expanded=False):
+            st.caption("รอจนกว่าเว็บจะเปิดราคาแล้วเทียบกับ 'ราคาที่ควรรับ' — ถ้าราคาจริงดีกว่าที่แสดงจึงค่อยพิจารณา (กดสแกนใหม่เพื่ออัปเดต)")
+            df_watch = pd.DataFrame(st.session_state.watchlist)
+            df_watch = df_watch.sort_values(by='xG รวม', key=lambda s: (s - 2.7).abs(), ascending=False).head(8).reset_index(drop=True)
+            st.dataframe(df_watch, width="stretch", hide_index=True)
 
 
 # ==========================================
@@ -438,6 +470,10 @@ with tab2:
             for index, row in pending_df.iterrows():
                 game_id = row['game_id']
                 bet_type = row['bet_type'] if 'bet_type' in pending_df.columns and row['bet_type'] in ('under', 'over') else 'under'
+                bet_line = 2.5
+                if 'line' in pending_df.columns and pd.notna(row['line']):
+                    try: bet_line = float(row['line'])
+                    except (TypeError, ValueError): bet_line = 2.5
                 progress_text.text(f"ตรวจสอบ: {row['home']} vs {row['away']}")
                 progress_bar.progress((index + 1) / len(pending_df))
 
@@ -445,8 +481,9 @@ with tab2:
                     g = all_yesterday_games[game_id]
                     home_ft = g.get('homeFTResult', 0) or 0; away_ft = g.get('awayFTResult', 0) or 0
                     total_goals = int(home_ft) + int(away_ft)
-                    # เส้น 2.5 ไม่มีผลเสมอ: Under ชนะเมื่อรวมสกอร์ไม่เกิน 2, Over ชนะเมื่อรวมสกอร์ตั้งแต่ 3 ขึ้นไป
-                    is_win = (total_goals <= 2) if bet_type == 'under' else (total_goals >= 3)
+                    # เส้นครึ่งไม่มีผลเสมอ: เช่นเส้น 3.5 → Under ชนะเมื่อยิงรวม ≤ 3, Over ชนะเมื่อยิงรวม ≥ 4
+                    goal_limit = int(bet_line)
+                    is_win = (total_goals <= goal_limit) if bet_type == 'under' else (total_goals >= goal_limit + 1)
                     profit_loss = (row['stake'] * (row['odds'] - 1)) if is_win else -row['stake']
 
                     status_str = '✅ ได้' if is_win else '❌ เสีย'
@@ -455,7 +492,7 @@ with tab2:
                     s['n'] += 1; s['wins'] += int(is_win); s['pl'] += profit_loss; s['staked'] += row['stake']
 
                     results.append({
-                        '🎯 ประเภท': SIDE_LABEL[bet_type],
+                        '🎯 ประเภท': f"{'🔽' if bet_type == 'under' else '🔼'} {'Under' if bet_type == 'under' else 'Over'} {bet_line:g}",
                         '🏆 ลีก': row['league'],
                         'คู่บอล': f"{row['home']} vs {row['away']}",
                         'สกอร์จริง': f"{home_ft}-{away_ft} (รวม {total_goals})",
@@ -465,7 +502,7 @@ with tab2:
                     })
                 else:
                     results.append({
-                        '🎯 ประเภท': SIDE_LABEL[bet_type],
+                        '🎯 ประเภท': f"{'🔽' if bet_type == 'under' else '🔼'} {'Under' if bet_type == 'under' else 'Over'} {bet_line:g}",
                         '🏆 ลีก': row['league'],
                         'คู่บอล': f"{row['home']} vs {row['away']}",
                         'สกอร์จริง': 'ไม่พบข้อมูล (อาจเลื่อน)',
