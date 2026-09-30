@@ -227,7 +227,12 @@ def collect_bookmaker_prices(game_id, game_data):
     bookmakers = fetch_prematch_odds(game_id)
     if isinstance(bookmakers, list):
         for b in bookmakers:
-            absorb(b.get('odds', []), b.get('bookmakerName', '?'))
+            name = (b.get('bookmakerName') or '').strip()
+            # ข้ามแหล่งราคาที่ไม่ใช่เจ้ามือจริง — Unknown / LsConverted / ไม่มีชื่อ
+            # (ราคาจากแหล่งเหล่านี้ไม่รู้รูปแบบและไม่มีที่ให้แทงจริง)
+            if not name or name.lower() in {'unknown', 'lsconverted'}:
+                continue
+            absorb(b.get('odds', []), name)
     return list(merged.values())
 
 def fair_line_suggestion(lambda_home, lambda_away, model_trust, stress_pct):
